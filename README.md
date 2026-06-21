@@ -177,6 +177,26 @@ Because of this design, the aggregate root fields itself already store encrypted
 
 ---
 
+## Release Automation
+
+This repository uses [Release Please](https://github.com/googleapis/release-please) to automate changelogs, version bumps, and git releases based on Conventional Commits.
+
+### How it Works
+
+1. On every push to the `main` branch, the `release-please` workflow checks the commit history since the last release.
+2. If there are new features (`feat:`) or bug fixes (`fix:`), it opens or updates a **Release PR** containing version increments and an updated `CHANGELOG.md`.
+3. When the Release PR is merged into `main`, it automatically:
+   - Tags the merge commit with the version tag (e.g. `v1.0.0`).
+   - Creates a corresponding GitHub Release with compilation notes and changelogs.
+
+### Downstream Workflow Triggering (Optional)
+
+By default, the workflow uses the standard `${{ secrets.GITHUB_TOKEN }}`. Because GitHub blocks actions taken by the default token from triggering other workflows:
+- Downstream workflows (like CI tests) will **not** trigger on the release PR or the release tag automatically.
+- If you require CI checks to run on the release PR and tag, configure a custom Personal Access Token (PAT) or GitHub App in your repository settings and reference it as `token: ${{ secrets.MY_CUSTOM_PAT }}` in `.github/workflows/release.yml`.
+
+---
+
 ## Verification
 
 Run checks, code formatters, linters, unit tests, and integration tests locally:
