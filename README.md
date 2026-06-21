@@ -157,8 +157,6 @@ if result.ToVersion() % 100 == 0 {
 return tx.Commit(ctx)
 ```
 
----
-
 ## Best Practices & Architecture Details
 
 ### Schema Versioning & Aggregates Evolution
@@ -169,34 +167,13 @@ When your aggregate root struct modifications break compatibility with previousl
 3. It discards the snapshot and replays the entire event stream from version 1.
 4. When a snapshot is saved next, it will overwrite the old snapshot with the new schema version and structure.
 
-*Note: For extremely long streams where full replay is slow, it is recommended to keep `SchemaVersion` at 1 and handle fallback migrations manually within your custom `Unmarshal` function.*
-
 ### Decoupled Encryption
 
-To secure snapshot payloads containing PII or sensitive secrets, wrap your custom `Marshal` and `Unmarshal` callbacks with `eventsalsa/encryption` (or any other encryption mechanism):
+In eventsalsa, sensitive fields (PII or secrets) are protected at the **field level** using custom value objects (e.g. `user.EncryptedEmail` strings) as explained in `eventsalsa/encryption` documentation. 
 
-```go
-config := snapshot.RepositoryConfig[*User]{
-	Marshal: func(u *User) ([]byte, error) {
-		plaintext, err := json.Marshal(u)
-		if err != nil {
-			return nil, err
-		}
-		return myEncryptor.Encrypt(plaintext)
-	},
-	Unmarshal: func(data []byte) (*User, error) {
-		plaintext, err := myEncryptor.Decrypt(data)
-		if err != nil {
-			return nil, err
-		}
-		var u User
-		err = json.Unmarshal(plaintext, &u)
-		return &u, err
-	},
-}
-```
-
-This keeps the core snapshot infrastructure simple, focused, and free of encryption library dependencies.
+Because of this design, the aggregate root fields itself already store encrypted ciphertext when in-memory. Therefore:
+- The standard serialization of the aggregate root (via `Marshal`) **automatically preserves** field-level encryption inside the snapshot payload.
+- You should **never** encrypt the full snapshot payload. Doing so is unnecessary, breaks payload inspectability, and deviates from eventsalsa's fine-grained field-level encryption boundaries.
 
 ---
 
