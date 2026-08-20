@@ -1,21 +1,27 @@
 version: 2
 updates:
-  - package-ecosystem: gomod
-    directory: /
+  # GitHub Actions updates
+  - package-ecosystem: "github-actions"
+    directory: "/"
     schedule:
-      interval: weekly
+      interval: "weekly"
+    commit-message:
+      prefix: "fix(deps)"
+      prefix-development: "fix(deps)"
     groups:
-      minor-and-patch:
-        update-types:
-          - minor
-          - patch
+      github-actions-dependencies:
+        patterns:
+          - "*"
 
-  - package-ecosystem: github-actions
-    directory: /
+  # Go modules updates
+  - package-ecosystem: "gomod"
+    directory: "/"
     schedule:
-      interval: weekly
+      interval: "weekly"
+    commit-message:
+      prefix: "fix(deps)"
+      prefix-development: "fix(deps)"
     groups:
-      actions:
-        update-types:
-          - minor
-          - patch
+      go-dependencies:
+        patterns:
+          - "*"
