@@ -3,9 +3,9 @@
 [![CI](https://github.com/eventsalsa/snapshot/actions/workflows/ci.yml/badge.svg)](https://github.com/eventsalsa/snapshot/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/eventsalsa/snapshot.svg)](https://pkg.go.dev/github.com/eventsalsa/snapshot)
 
-`github.com/eventsalsa/snapshot` is a generic, PostgreSQL-backed aggregate state snapshotting module for Go event-sourced applications. 
+`github.com/eventsalsa/snapshot` is a generic, PostgreSQL-backed stream state snapshotting module for Go event-sourced applications. 
 
-It is designed to be used alongside [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store). By saving a snapshot of the aggregate state at a specific version, you avoid loading the full stream of events from version 1. Instead, the snapshot repository loads the latest snapshot, queries only subsequent events (the delta), and replays them to reconstruct the active state.
+It is designed to be used alongside [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store). By saving a snapshot of the stream state at a specific version, you avoid loading the full stream of events from version 1. Instead, the snapshot repository loads the latest snapshot, queries only subsequent events (the delta), and replays them to reconstruct the active state.
 
 ## Features
 
@@ -29,7 +29,7 @@ go get github.com/eventsalsa/snapshot
 
 ### 1. Generate & Apply DB Migration
 
-Use the CLI tool to generate the migration file containing the DDL for the `aggregate_snapshots` table:
+Use the CLI tool to generate the migration file containing the DDL for the `snapshots` table:
 
 ```bash
 go run github.com/eventsalsa/snapshot/cmd/migrate-gen -output migrations
@@ -38,26 +38,26 @@ go run github.com/eventsalsa/snapshot/cmd/migrate-gen -output migrations
 This generates a file named like `migrations/<timestamp>_init_snapshots.sql`:
 
 ```sql
-CREATE TABLE IF NOT EXISTS aggregate_snapshots (
-    aggregate_type TEXT NOT NULL,
-    aggregate_id TEXT NOT NULL,
-    aggregate_version BIGINT NOT NULL,
+CREATE TABLE IF NOT EXISTS snapshots (
+    stream_type TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    stream_version BIGINT NOT NULL,
     schema_version INT NOT NULL,
     payload BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
-    PRIMARY KEY (aggregate_type, aggregate_id)
+    PRIMARY KEY (stream_type, stream_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_aggregate_snapshots_schema_version 
-    ON aggregate_snapshots (schema_version);
+CREATE INDEX IF NOT EXISTS idx_snapshots_schema_version 
+    ON snapshots (schema_version);
 ```
 
 Apply this migration using your preferred PostgreSQL migration runner.
 
 ### 2. Define a Domain Model (Clean)
 
-Your aggregate structs remain completely clean of library code:
+Your stream state structs remain completely clean of library code:
 
 ```go
 type User struct {
@@ -88,7 +88,7 @@ snapshotStore := snapshotpostgres.NewStore(snapshotpostgres.DefaultStoreConfig()
 
 // 2. Define repository configuration
 config := snapshot.RepositoryConfig[*User]{
-	AggregateType: "User",
+	StreamType:    "User",
 	SchemaVersion: 1, // Current shape version of the User struct
 
 	Initializer: func(id string) *User {
@@ -96,7 +96,7 @@ config := snapshot.RepositoryConfig[*User]{
 	},
 
 	Apply: func(u *User, event store.PersistedEvent) (*User, error) {
-		// Apply event payload to mutate aggregate state
+		// Apply event payload to mutate stream state
 		switch event.EventType {
 		case "UserCreated":
 			// ...
@@ -159,11 +159,11 @@ return tx.Commit(ctx)
 
 ## Best Practices & Architecture Details
 
-### Schema Versioning & Aggregates Evolution
+### Schema Versioning & Stream Evolution
 
-When your aggregate root struct modifications break compatibility with previously serialized snapshot payloads:
+When your domain model struct modifications break compatibility with previously serialized snapshot payloads:
 1. Increment the `SchemaVersion` integer in your `RepositoryConfig`.
-2. When the application loads the aggregate, the repository detects that the stored snapshot's schema version mismatches the configuration.
+2. When the application loads the stream state, the repository detects that the stored snapshot's schema version mismatches the configuration.
 3. It discards the snapshot and replays the entire event stream from version 1.
 4. When a snapshot is saved next, it will overwrite the old snapshot with the new schema version and structure.
 
@@ -171,8 +171,8 @@ When your aggregate root struct modifications break compatibility with previousl
 
 In eventsalsa, sensitive fields (PII or secrets) are protected at the **field level** using custom value objects (e.g. `user.EncryptedEmail` strings) as explained in `eventsalsa/encryption` documentation. 
 
-Because of this design, the aggregate root fields itself already store encrypted ciphertext when in-memory. Therefore:
-- The standard serialization of the aggregate root (via `Marshal`) **automatically preserves** field-level encryption inside the snapshot payload.
+Because of this design, the domain state fields itself already store encrypted ciphertext when in-memory. Therefore:
+- The standard serialization of the stream state (via `Marshal`) **automatically preserves** field-level encryption inside the snapshot payload.
 - You should **never** encrypt the full snapshot payload. Doing so is unnecessary, breaks payload inspectability, and deviates from eventsalsa's fine-grained field-level encryption boundaries.
 
 ---
