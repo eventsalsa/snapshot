@@ -1,4 +1,4 @@
-// Command migrate-gen generates SQL migration files for aggregate snapshots.
+// Command migrate-gen generates SQL migration files for stream snapshots.
 //
 // Usage:
 //
@@ -21,7 +21,7 @@ func main() {
 	var (
 		outputFolder   = flag.String("output", "migrations", "Output folder for migration file")
 		outputFilename = flag.String("filename", "", "Output filename (default: timestamp-based)")
-		snapshotsTable = flag.String("snapshots-table", "aggregate_snapshots", "Name of snapshots table")
+		snapshotsTable = flag.String("snapshots-table", "snapshots", "Name of snapshots table")
 	)
 
 	flag.Parse()
