@@ -22,7 +22,7 @@ import (
 	snapshotpostgres "github.com/eventsalsa/snapshot/postgres"
 )
 
-// TestUser is the aggregate state model used for testing.
+// TestUser is the stream state model used for testing.
 type TestUser struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
@@ -73,9 +73,9 @@ func setupPostgres(t *testing.T) *pgxpool.Pool {
 	eventStoreDDL := `
 	CREATE TABLE IF NOT EXISTS events (
 		global_position BIGSERIAL PRIMARY KEY,
-		aggregate_type TEXT NOT NULL,
-		aggregate_id TEXT NOT NULL,
-		aggregate_version BIGINT NOT NULL,
+		stream_type TEXT NOT NULL,
+		stream_id TEXT NOT NULL,
+		stream_version BIGINT NOT NULL,
 		event_id UUID NOT NULL UNIQUE,
 		event_type TEXT NOT NULL,
 		event_version INT NOT NULL DEFAULT 1,
@@ -85,26 +85,26 @@ func setupPostgres(t *testing.T) *pgxpool.Pool {
 		causation_id TEXT,
 		metadata JSONB,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		UNIQUE (aggregate_type, aggregate_id, aggregate_version)
+		UNIQUE (stream_type, stream_id, stream_version)
 	);
-	CREATE TABLE IF NOT EXISTS aggregate_heads (
-		aggregate_type TEXT NOT NULL,
-		aggregate_id TEXT NOT NULL,
-		aggregate_version BIGINT NOT NULL,
+	CREATE TABLE IF NOT EXISTS stream_heads (
+		stream_type TEXT NOT NULL,
+		stream_id TEXT NOT NULL,
+		stream_version BIGINT NOT NULL,
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (aggregate_type, aggregate_id)
+		PRIMARY KEY (stream_type, stream_id)
 	);
 	`
 	// Create tables for snapshots
 	snapshotDDL := `
-	CREATE TABLE IF NOT EXISTS aggregate_snapshots (
-		aggregate_type TEXT NOT NULL,
-		aggregate_id TEXT NOT NULL,
-		aggregate_version BIGINT NOT NULL,
+	CREATE TABLE IF NOT EXISTS snapshots (
+		stream_type TEXT NOT NULL,
+		stream_id TEXT NOT NULL,
+		stream_version BIGINT NOT NULL,
 		schema_version INT NOT NULL,
 		payload BYTEA NOT NULL,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (aggregate_type, aggregate_id)
+		PRIMARY KEY (stream_type, stream_id)
 	);
 	`
 
@@ -127,12 +127,12 @@ func appendTestEvent(t *testing.T, ctx context.Context, tx pgx.Tx, es store.Even
 
 	events := []store.Event{
 		{
-			AggregateType: "User",
-			AggregateID:   id,
-			EventID:       uuid.New(),
-			EventType:     eventType,
-			Payload:       payload,
-			CreatedAt:     time.Now(),
+			StreamType: "User",
+			StreamID:   id,
+			EventID:    uuid.New(),
+			EventType:  eventType,
+			Payload:    payload,
+			CreatedAt:  time.Now(),
 		},
 	}
 
@@ -162,17 +162,17 @@ func TestRawStoreGetPut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
-	if snap.AggregateVersion != 0 {
-		t.Errorf("expected version 0 for missing snapshot, got %d", snap.AggregateVersion)
+	if snap.StreamVersion != 0 {
+		t.Errorf("expected version 0 for missing snapshot, got %d", snap.StreamVersion)
 	}
 
 	// 2. Put snapshot
 	inputSnap := snapshot.Snapshot{
-		AggregateType:    "User",
-		AggregateID:      id,
-		AggregateVersion: 5,
-		SchemaVersion:    1,
-		Payload:          []byte(`{"id":"` + id + `","name":"Alice"}`),
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 5,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"id":"` + id + `","name":"Alice"}`),
 	}
 	err = store.Put(ctx, tx, &inputSnap)
 	if err != nil {
@@ -184,8 +184,8 @@ func TestRawStoreGetPut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
-	if snap.AggregateVersion != 5 {
-		t.Errorf("expected version 5, got %d", snap.AggregateVersion)
+	if snap.StreamVersion != 5 {
+		t.Errorf("expected version 5, got %d", snap.StreamVersion)
 	}
 	if snap.SchemaVersion != 1 {
 		t.Errorf("expected schema version 1, got %d", snap.SchemaVersion)
@@ -196,7 +196,7 @@ func TestRawStoreGetPut(t *testing.T) {
 
 	// 4. Overwrite/Update snapshot
 	updatedSnap := inputSnap
-	updatedSnap.AggregateVersion = 10
+	updatedSnap.StreamVersion = 10
 	updatedSnap.Payload = []byte(`{"id":"` + id + `","name":"Alice Smith"}`)
 	err = store.Put(ctx, tx, &updatedSnap)
 	if err != nil {
@@ -208,8 +208,8 @@ func TestRawStoreGetPut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get updated failed: %v", err)
 	}
-	if snap.AggregateVersion != 10 {
-		t.Errorf("expected updated version 10, got %d", snap.AggregateVersion)
+	if snap.StreamVersion != 10 {
+		t.Errorf("expected updated version 10, got %d", snap.StreamVersion)
 	}
 	if string(snap.Payload) != string(updatedSnap.Payload) {
 		t.Errorf("payload mismatch: got %s, expected %s", snap.Payload, updatedSnap.Payload)
@@ -225,7 +225,7 @@ func TestRepositoryRehydration(t *testing.T) {
 
 	applyCallCount := 0
 	config := snapshot.RepositoryConfig[*TestUser]{
-		AggregateType: "User",
+		StreamType:    "User",
 		SchemaVersion: 1,
 		Initializer: func(id string) *TestUser {
 			return &TestUser{ID: id}
@@ -368,7 +368,7 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 	ss := snapshotpostgres.NewStore(snapshotpostgres.DefaultStoreConfig())
 
 	config := snapshot.RepositoryConfig[*TestUser]{
-		AggregateType: "User",
+		StreamType:    "User",
 		SchemaVersion: 1,
 		Initializer: func(id string) *TestUser {
 			return &TestUser{ID: id}
@@ -403,12 +403,12 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 			t.Error("expected error for nil snapshot store")
 		}
 	})
-	t.Run("empty aggregate type", func(t *testing.T) {
+	t.Run("empty stream type", func(t *testing.T) {
 		cfg := config
-		cfg.AggregateType = ""
+		cfg.StreamType = ""
 		_, err := snapshot.NewRepository(es, ss, cfg)
 		if err == nil {
-			t.Error("expected error for empty AggregateType")
+			t.Error("expected error for empty StreamType")
 		}
 	})
 	t.Run("nil initializer", func(t *testing.T) {
@@ -442,11 +442,11 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 	// 3. Unmarshal failure
 	// We put corrupt payload manually
 	corruptSnap := snapshot.Snapshot{
-		AggregateType:    "User",
-		AggregateID:      id,
-		AggregateVersion: 3,
-		SchemaVersion:    1,
-		Payload:          []byte(`invalid-json-payload{}`),
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 3,
+		SchemaVersion: 1,
+		Payload:       []byte(`invalid-json-payload{}`),
 	}
 	if err := ss.Put(ctx, tx, &corruptSnap); err != nil {
 		t.Fatalf("failed to write corrupt snapshot: %v", err)

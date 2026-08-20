@@ -26,7 +26,7 @@ func DefaultConfig() Config {
 	return Config{
 		OutputFolder:   "migrations",
 		OutputFilename: fmt.Sprintf("%s_init_snapshots.sql", timestamp),
-		SnapshotsTable: "aggregate_snapshots",
+		SnapshotsTable: "snapshots",
 	}
 }
 
@@ -48,19 +48,19 @@ func GeneratePostgres(config *Config) error {
 }
 
 func generatePostgresSQL(config *Config) string {
-	return fmt.Sprintf(`-- Aggregate Snapshots DDL Migration
+	return fmt.Sprintf(`-- Snapshots DDL Migration
 -- Generated: %s
 
--- Table to store aggregate state snapshots
+-- Table to store stream state snapshots
 CREATE TABLE IF NOT EXISTS %s (
-    aggregate_type TEXT NOT NULL,
-    aggregate_id TEXT NOT NULL,
-    aggregate_version BIGINT NOT NULL,
+    stream_type TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    stream_version BIGINT NOT NULL,
     schema_version INT NOT NULL,
     payload BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
-    PRIMARY KEY (aggregate_type, aggregate_id)
+    PRIMARY KEY (stream_type, stream_id)
 );
 
 -- Index for schema version analysis/observability

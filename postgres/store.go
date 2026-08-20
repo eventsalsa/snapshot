@@ -25,7 +25,7 @@ type StoreConfig struct {
 // DefaultStoreConfig returns the default configuration.
 func DefaultStoreConfig() *StoreConfig {
 	return &StoreConfig{
-		SnapshotsTable: "aggregate_snapshots",
+		SnapshotsTable: "snapshots",
 		Logger:         nil, // No logging by default
 	}
 }
@@ -70,28 +70,28 @@ func NewStore(config *StoreConfig) *Store {
 }
 
 // Get implements snapshot.Store.
-// It retrieves the latest snapshot for the given aggregate.
+// It retrieves the latest snapshot for the given stream.
 // Returns a zero Snapshot and nil if no snapshot exists.
-func (s *Store) Get(ctx context.Context, tx pgx.Tx, aggregateType, aggregateID string) (snapshot.Snapshot, error) {
+func (s *Store) Get(ctx context.Context, tx pgx.Tx, streamType, streamID string) (snapshot.Snapshot, error) {
 	if s.config.Logger != nil {
 		s.config.Logger.Debug(ctx, "fetching snapshot",
-			"aggregate_type", aggregateType,
-			"aggregate_id", aggregateID)
+			"stream_type", streamType,
+			"stream_id", streamID)
 	}
 
 	//nolint:gosec // G201: table name from trusted config, not user input
 	query := fmt.Sprintf(`
-		SELECT aggregate_version, schema_version, payload, created_at 
+		SELECT stream_version, schema_version, payload, created_at 
 		FROM %s 
-		WHERE aggregate_type = $1 AND aggregate_id = $2
+		WHERE stream_type = $1 AND stream_id = $2
 	`, s.config.SnapshotsTable)
 
 	var snap snapshot.Snapshot
-	snap.AggregateType = aggregateType
-	snap.AggregateID = aggregateID
+	snap.StreamType = streamType
+	snap.StreamID = streamID
 
-	err := tx.QueryRow(ctx, query, aggregateType, aggregateID).Scan(
-		&snap.AggregateVersion,
+	err := tx.QueryRow(ctx, query, streamType, streamID).Scan(
+		&snap.StreamVersion,
 		&snap.SchemaVersion,
 		&snap.Payload,
 		&snap.CreatedAt,
@@ -101,8 +101,8 @@ func (s *Store) Get(ctx context.Context, tx pgx.Tx, aggregateType, aggregateID s
 		if errors.Is(err, pgx.ErrNoRows) {
 			if s.config.Logger != nil {
 				s.config.Logger.Debug(ctx, "snapshot not found",
-					"aggregate_type", aggregateType,
-					"aggregate_id", aggregateID)
+					"stream_type", streamType,
+					"stream_id", streamID)
 			}
 			return snapshot.Snapshot{}, nil
 		}
@@ -111,9 +111,9 @@ func (s *Store) Get(ctx context.Context, tx pgx.Tx, aggregateType, aggregateID s
 
 	if s.config.Logger != nil {
 		s.config.Logger.Debug(ctx, "snapshot retrieved successfully",
-			"aggregate_type", aggregateType,
-			"aggregate_id", aggregateID,
-			"aggregate_version", snap.AggregateVersion,
+			"stream_type", streamType,
+			"stream_id", streamID,
+			"stream_version", snap.StreamVersion,
 			"schema_version", snap.SchemaVersion)
 	}
 
@@ -121,33 +121,33 @@ func (s *Store) Get(ctx context.Context, tx pgx.Tx, aggregateType, aggregateID s
 }
 
 // Put implements snapshot.Store.
-// It saves (inserts or updates) a snapshot for the aggregate.
+// It saves (inserts or updates) a snapshot for the stream.
 // Overwrites the existing snapshot if it already exists for the (type, id) pair.
 func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) error {
 	if s.config.Logger != nil {
 		s.config.Logger.Debug(ctx, "saving snapshot",
-			"aggregate_type", snap.AggregateType,
-			"aggregate_id", snap.AggregateID,
-			"aggregate_version", snap.AggregateVersion,
+			"stream_type", snap.StreamType,
+			"stream_id", snap.StreamID,
+			"stream_version", snap.StreamVersion,
 			"schema_version", snap.SchemaVersion)
 	}
 
 	//nolint:gosec // G201: table name from trusted config, not user input
 	query := fmt.Sprintf(`
-		INSERT INTO %s (aggregate_type, aggregate_id, aggregate_version, schema_version, payload, created_at)
+		INSERT INTO %s (stream_type, stream_id, stream_version, schema_version, payload, created_at)
 		VALUES ($1, $2, $3, $4, $5, NOW())
-		ON CONFLICT (aggregate_type, aggregate_id)
+		ON CONFLICT (stream_type, stream_id)
 		DO UPDATE SET 
-			aggregate_version = EXCLUDED.aggregate_version,
+			stream_version = EXCLUDED.stream_version,
 			schema_version = EXCLUDED.schema_version,
 			payload = EXCLUDED.payload,
 			created_at = NOW()
 	`, s.config.SnapshotsTable)
 
 	_, err := tx.Exec(ctx, query,
-		snap.AggregateType,
-		snap.AggregateID,
-		snap.AggregateVersion,
+		snap.StreamType,
+		snap.StreamID,
+		snap.StreamVersion,
 		snap.SchemaVersion,
 		snap.Payload,
 	)
@@ -157,9 +157,9 @@ func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) err
 
 	if s.config.Logger != nil {
 		s.config.Logger.Debug(ctx, "snapshot saved successfully",
-			"aggregate_type", snap.AggregateType,
-			"aggregate_id", snap.AggregateID,
-			"aggregate_version", snap.AggregateVersion)
+			"stream_type", snap.StreamType,
+			"stream_id", snap.StreamID,
+			"stream_version", snap.StreamVersion)
 	}
 
 	return nil
