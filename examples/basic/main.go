@@ -16,7 +16,7 @@ import (
 	snapshotpostgres "github.com/eventsalsa/snapshot/postgres"
 )
 
-// User is our clean domain aggregate.
+// User is our clean domain model.
 // It has no eventsalsa dependencies or embedded types.
 type User struct {
 	ID    string `json:"id"`
@@ -63,7 +63,7 @@ func main() {
 
 	// 3. Define Repository Configuration
 	repoConfig := snapshot.RepositoryConfig[*User]{
-		AggregateType: "User",
+		StreamType:    "User",
 		SchemaVersion: 1, // Current schema version of the User model
 
 		Initializer: func(id string) *User {
@@ -71,7 +71,7 @@ func main() {
 		},
 
 		Apply: func(u *User, event store.PersistedEvent) (*User, error) {
-			fmt.Printf("  [Apply Event] Replaying %s (v%d)\n", event.EventType, event.AggregateVersion)
+			fmt.Printf("  [Apply Event] Replaying %s (v%d)\n", event.EventType, event.StreamVersion)
 			switch event.EventType {
 			case "UserCreated":
 				var payload UserCreated
@@ -116,7 +116,7 @@ func main() {
 
 	userID := uuid.New().String()
 
-	// --- Step 1: Load Aggregate (from empty) ---
+	// --- Step 1: Load Stream State (from empty) ---
 	fmt.Println("\n--- Step 1: Loading non-existent User ---")
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -141,12 +141,12 @@ func main() {
 	payload, _ := json.Marshal(UserCreated{Name: "Alice", Email: "alice@example.com"})
 	events := []store.Event{
 		{
-			AggregateType: "User",
-			AggregateID:   userID,
-			EventID:       uuid.New(),
-			EventType:     "UserCreated",
-			Payload:       payload,
-			CreatedAt:     time.Now(),
+			StreamType: "User",
+			StreamID:   userID,
+			EventID:    uuid.New(),
+			EventType:  "UserCreated",
+			Payload:    payload,
+			CreatedAt:  time.Now(),
 		},
 	}
 	result, err := eventStore.Append(ctx, tx, store.NoStream(), events)
@@ -169,12 +169,12 @@ func main() {
 		payload, _ = json.Marshal(UserEmailChanged{Email: email})
 		ev := []store.Event{
 			{
-				AggregateType: "User",
-				AggregateID:   userID,
-				EventID:       uuid.New(),
-				EventType:     "UserEmailChanged",
-				Payload:       payload,
-				CreatedAt:     time.Now(),
+				StreamType: "User",
+				StreamID:   userID,
+				EventID:    uuid.New(),
+				EventType:  "UserEmailChanged",
+				Payload:    payload,
+				CreatedAt:  time.Now(),
 			},
 		}
 		res, err := eventStore.Append(ctx, tx, store.Exact(currVer), ev)
@@ -219,12 +219,12 @@ func main() {
 		payload, _ = json.Marshal(UserNameChanged{Name: name})
 		ev := []store.Event{
 			{
-				AggregateType: "User",
-				AggregateID:   userID,
-				EventID:       uuid.New(),
-				EventType:     "UserNameChanged",
-				Payload:       payload,
-				CreatedAt:     time.Now(),
+				StreamType: "User",
+				StreamID:   userID,
+				EventID:    uuid.New(),
+				EventType:  "UserNameChanged",
+				Payload:    payload,
+				CreatedAt:  time.Now(),
 			},
 		}
 		res, err := eventStore.Append(ctx, tx, store.Exact(version), ev)
@@ -236,7 +236,7 @@ func main() {
 	_ = tx.Commit(ctx)
 	fmt.Printf("User is now at version: %d\n", version)
 
-	// --- Step 6: Load aggregate (should hit snapshot v5 and only replay v6 & v7) ---
+	// --- Step 6: Load stream (should hit snapshot v5 and only replay v6 & v7) ---
 	fmt.Println("\n--- Step 6: Loading User (should use snapshot v5 and only replay v6 & v7) ---")
 	tx, err = db.Begin(ctx)
 	if err != nil {
@@ -274,13 +274,13 @@ func main() {
 }
 
 func setupTables(ctx context.Context, db *pgxpool.Pool) {
-	// DDL schema for events and aggregate_heads (from store migrations)
+	// DDL schema for events and stream_heads (from store migrations)
 	eventStoreSchema := `
 	CREATE TABLE IF NOT EXISTS events (
 		global_position BIGSERIAL PRIMARY KEY,
-		aggregate_type TEXT NOT NULL,
-		aggregate_id TEXT NOT NULL,
-		aggregate_version BIGINT NOT NULL,
+		stream_type TEXT NOT NULL,
+		stream_id TEXT NOT NULL,
+		stream_version BIGINT NOT NULL,
 		event_id UUID NOT NULL UNIQUE,
 		event_type TEXT NOT NULL,
 		event_version INT NOT NULL DEFAULT 1,
@@ -290,27 +290,27 @@ func setupTables(ctx context.Context, db *pgxpool.Pool) {
 		causation_id TEXT,
 		metadata JSONB,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		UNIQUE (aggregate_type, aggregate_id, aggregate_version)
+		UNIQUE (stream_type, stream_id, stream_version)
 	);
-	CREATE TABLE IF NOT EXISTS aggregate_heads (
-		aggregate_type TEXT NOT NULL,
-		aggregate_id TEXT NOT NULL,
-		aggregate_version BIGINT NOT NULL,
+	CREATE TABLE IF NOT EXISTS stream_heads (
+		stream_type TEXT NOT NULL,
+		stream_id TEXT NOT NULL,
+		stream_version BIGINT NOT NULL,
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (aggregate_type, aggregate_id)
+		PRIMARY KEY (stream_type, stream_id)
 	);
 	`
 
-	// DDL schema for aggregate_snapshots
+	// DDL schema for snapshots
 	snapshotSchema := `
-	CREATE TABLE IF NOT EXISTS aggregate_snapshots (
-		aggregate_type TEXT NOT NULL,
-		aggregate_id TEXT NOT NULL,
-		aggregate_version BIGINT NOT NULL,
+	CREATE TABLE IF NOT EXISTS snapshots (
+		stream_type TEXT NOT NULL,
+		stream_id TEXT NOT NULL,
+		stream_version BIGINT NOT NULL,
 		schema_version INT NOT NULL,
 		payload BYTEA NOT NULL,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (aggregate_type, aggregate_id)
+		PRIMARY KEY (stream_type, stream_id)
 	);
 	`
 
@@ -334,8 +334,8 @@ func setupTables(ctx context.Context, db *pgxpool.Pool) {
 
 	// Clean up any old data for this example run
 	_, _ = tx.Exec(ctx, "TRUNCATE TABLE events CASCADE;")
-	_, _ = tx.Exec(ctx, "TRUNCATE TABLE aggregate_heads CASCADE;")
-	_, _ = tx.Exec(ctx, "TRUNCATE TABLE aggregate_snapshots CASCADE;")
+	_, _ = tx.Exec(ctx, "TRUNCATE TABLE stream_heads CASCADE;")
+	_, _ = tx.Exec(ctx, "TRUNCATE TABLE snapshots CASCADE;")
 
 	err = tx.Commit(ctx)
 	if err != nil {
