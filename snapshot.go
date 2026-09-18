@@ -222,6 +222,21 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Res
 		return res, fmt.Errorf("failed to read stream: %w", err)
 	}
 
+	if initialized && len(stream.Events) == 0 {
+		fullStream, valid, verifyErr := r.verifySnapshotInStream(ctx, tx, id, &snap)
+		if verifyErr != nil {
+			return res, verifyErr
+		}
+		if !valid {
+			res.State = r.config.Initializer(id)
+			res.SnapshotHit = false
+			res.SnapshotVersion = 0
+			res.SchemaVersion = 0
+			version = 0
+			stream = fullStream
+		}
+	}
+
 	for i := range stream.Events {
 		res.State, err = r.config.Apply(res.State, stream.Events[i])
 		if err != nil {
@@ -236,10 +251,43 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Res
 	return res, nil
 }
 
+func (r *Repository[T]) verifySnapshotInStream(ctx context.Context, tx pgx.Tx, id string, snap *Snapshot) (store.Stream, bool, error) {
+	headCheck, err := r.reader.ReadStream(ctx, tx, r.config.StreamType, id, &snap.StreamVersion, &snap.StreamVersion)
+	if err != nil {
+		return store.Stream{}, false, fmt.Errorf("failed to verify snapshot version in stream: %w", err)
+	}
+	if !headCheck.IsEmpty() {
+		return store.Stream{}, true, nil
+	}
+
+	if r.config.Logger != nil {
+		r.config.Logger.Error(ctx, "snapshot version not found in event log; falling back to full stream replay",
+			"stream_type", r.config.StreamType,
+			"stream_id", id,
+			"snapshot_version", snap.StreamVersion,
+			"schema_version", snap.SchemaVersion,
+		)
+	}
+
+	fullStream, err := r.reader.ReadStream(ctx, tx, r.config.StreamType, id, nil, nil)
+	if err != nil {
+		return store.Stream{}, false, fmt.Errorf("failed to replay full stream: %w", err)
+	}
+	return fullStream, false, nil
+}
+
 // Save persists a snapshot of the current stream state at the specified version.
 func (r *Repository[T]) Save(ctx context.Context, tx pgx.Tx, id string, version int64, state T) error {
 	if version <= 0 {
 		return fmt.Errorf("invalid stream version: %d", version)
+	}
+
+	check, err := r.reader.ReadStream(ctx, tx, r.config.StreamType, id, &version, &version)
+	if err != nil {
+		return fmt.Errorf("failed to verify stream version: %w", err)
+	}
+	if check.IsEmpty() {
+		return fmt.Errorf("cannot save snapshot at version %d: stream version does not exist in event log", version)
 	}
 
 	payload, err := r.config.Marshal(state)
