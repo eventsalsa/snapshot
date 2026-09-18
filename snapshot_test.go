@@ -164,6 +164,26 @@ func TestNewRepository_Validation(t *testing.T) {
 			errSubstr: "unmarshal cannot be nil",
 		},
 		{
+			name:   "zero schema version",
+			reader: reader,
+			store:  snapStore,
+			cfgMod: func(c *snapshot.RepositoryConfig[*userState]) {
+				c.SchemaVersion = 0
+			},
+			wantErr:   true,
+			errSubstr: "schema version must be >= 1",
+		},
+		{
+			name:   "negative schema version",
+			reader: reader,
+			store:  snapStore,
+			cfgMod: func(c *snapshot.RepositoryConfig[*userState]) {
+				c.SchemaVersion = -1
+			},
+			wantErr:   true,
+			errSubstr: "schema version must be >= 1",
+		},
+		{
 			name:    "valid configuration",
 			reader:  reader,
 			store:   snapStore,
