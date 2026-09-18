@@ -49,6 +49,7 @@ type RepositoryConfig[T any] struct {
 	StreamType string
 
 	// SchemaVersion is the current version of the stream struct/logic schema.
+	// Must be a positive integer (>= 1); version 0 is reserved for uninitialized configuration.
 	// If a stored snapshot has a different SchemaVersion, it is ignored
 	// and the stream is rehydrated from version 1 of the event log.
 	SchemaVersion int
@@ -88,6 +89,9 @@ func NewRepository[T any](
 	}
 	if config.Unmarshal == nil {
 		return nil, fmt.Errorf("unmarshal cannot be nil")
+	}
+	if config.SchemaVersion <= 0 {
+		return nil, fmt.Errorf("schema version must be >= 1 (got %d); version 0 is reserved for uninitialized configuration", config.SchemaVersion)
 	}
 	return &Repository[T]{
 		reader:        reader,
