@@ -222,30 +222,35 @@ func main() {
 	_ = tx.Commit(ctx)
 	fmt.Printf("Snapshot saved safely at version %d with updated state: %+v\n", appendRes.ToVersion(), updatedUser)
 
-	// --- Step 5: Add more events (v6 & v7) via transactional Execute ---
-	fmt.Println("\n--- Step 5: Appending events (v6 & v7) via transactional Execute ---")
+	// --- Step 5: Add more events (v6 & v7) ---
+	fmt.Println("\n--- Step 5: Appending events (v6 & v7) without taking a snapshot ---")
 	tx, err = db.Begin(ctx)
 	if err != nil {
 		log.Fatalf("Failed to begin tx: %v", err)
 	}
 
 	names := []string{"Alice S.", "Alice Smith"}
-	execRes, _, err := repo.Execute(ctx, tx, userID, eventStore, func(_ *User, _ int64) ([]store.Event, error) {
-		events := make([]store.Event, len(names))
-		for i, name := range names {
-			p, _ := json.Marshal(UserNameChanged{Name: name})
-			events[i] = store.Event{
-				EventType: "UserNameChanged",
-				Payload:   p,
-			}
+	currVer = appendRes.ToVersion()
+	for _, name := range names {
+		payload, _ = json.Marshal(UserNameChanged{Name: name})
+		ev := []store.Event{
+			{
+				StreamType: "User",
+				StreamID:   userID,
+				EventID:    uuid.New(),
+				EventType:  "UserNameChanged",
+				Payload:    payload,
+				CreatedAt:  time.Now(),
+			},
 		}
-		return events, nil
-	}, snapshot.Never())
-	if err != nil {
-		log.Fatalf("Execute failed: %v", err)
+		resAppend, err := eventStore.Append(ctx, tx, store.Exact(currVer), ev)
+		if err != nil {
+			log.Fatalf("Append failed: %v", err)
+		}
+		currVer = resAppend.ToVersion()
 	}
 	_ = tx.Commit(ctx)
-	fmt.Printf("User after Execute: %+v is at version: %d\n", execRes.State, execRes.StreamVersion)
+	fmt.Printf("User is now at version: %d (snapshot remains at v5)\n", currVer)
 
 	// --- Step 6: Load stream (should hit snapshot v5 and only replay v6 & v7) ---
 	fmt.Println("\n--- Step 6: Loading User (should use snapshot v5 and only replay v6 & v7) ---")
