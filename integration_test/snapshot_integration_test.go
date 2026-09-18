@@ -216,6 +216,85 @@ func TestRawStoreGetPut(t *testing.T) {
 	}
 }
 
+func TestRawStoreMonotonicVersionGuard(t *testing.T) {
+	db := setupPostgres(t)
+	ctx := context.Background()
+	store := snapshotpostgres.NewStore(snapshotpostgres.DefaultStoreConfig())
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	id := uuid.New().String()
+
+	// 1. Put initial snapshot at v30
+	snap30 := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 30,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"name":"Alice","version":30}`),
+	}
+	if err := store.Put(ctx, tx, &snap30); err != nil {
+		t.Fatalf("Put v30 failed: %v", err)
+	}
+
+	// Verify it was stored at v30
+	snap, err := store.Get(ctx, tx, "User", id)
+	if err != nil {
+		t.Fatalf("Get v30 failed: %v", err)
+	}
+	if snap.StreamVersion != 30 {
+		t.Fatalf("expected version 30, got %d", snap.StreamVersion)
+	}
+
+	// 2. Attempt to put an older snapshot at v10 (version regression)
+	snap10 := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 10,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"name":"Alice","version":10}`),
+	}
+	if err := store.Put(ctx, tx, &snap10); err != nil {
+		t.Fatalf("Put v10 should succeed as a no-op, got error: %v", err)
+	}
+
+	// Verify the row did NOT regress to v10
+	snap, err = store.Get(ctx, tx, "User", id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if snap.StreamVersion != 30 {
+		t.Errorf("version regressed! expected 30, got %d", snap.StreamVersion)
+	}
+	if string(snap.Payload) != string(snap30.Payload) {
+		t.Errorf("payload regressed! expected %s, got %s", snap30.Payload, snap.Payload)
+	}
+
+	// 3. Put snapshot at v31 (advancing version)
+	snap31 := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 31,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"name":"Alice","version":31}`),
+	}
+	if err := store.Put(ctx, tx, &snap31); err != nil {
+		t.Fatalf("Put v31 failed: %v", err)
+	}
+
+	snap, err = store.Get(ctx, tx, "User", id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if snap.StreamVersion != 31 {
+		t.Errorf("expected version 31, got %d", snap.StreamVersion)
+	}
+}
+
 func TestRepositoryRehydration(t *testing.T) {
 	db := setupPostgres(t)
 	ctx := context.Background()
