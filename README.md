@@ -121,9 +121,11 @@ config := snapshot.RepositoryConfig[*User]{
 userRepo, err := snapshot.NewRepository(eventStore, snapshotStore, config)
 ```
 
-### 4. Load & Save in Command Handlers
+### 4. Executing Commands & Saving Snapshots
 
-Your command handlers run within database transactions:
+#### Pattern A: Orchestrated Pipeline with `Execute` (Recommended)
+
+`Execute` coordinates loading rehydrated state, invoking your domain business logic, appending newly produced events to `eventsalsa/store`, folding them into the current state via your `Apply` function, and conditionally persisting a fresh snapshot according to your policy—all inside your PostgreSQL transaction:
 
 ```go
 tx, err := db.Begin(ctx)
@@ -132,32 +134,78 @@ if err != nil {
 }
 defer tx.Rollback(ctx)
 
-// Load rehydrates state from snapshot + delta events
-res, err := userRepo.Load(ctx, tx, userID)
+// Execute handles Load -> domain logic -> Append -> Apply folding -> Snapshot
+res, appendRes, err := userRepo.Execute(
+	ctx,
+	tx,
+	userID,
+	eventStore,
+	func(u *User, version int64) ([]store.Event, error) {
+		// Domain logic: validate invariants against current state u
+		if u.Blocked {
+			return nil, errors.New("user is blocked")
+		}
+
+		payload, err := json.Marshal(UserEmailChanged{Email: newEmail})
+		if err != nil {
+			return nil, err
+		}
+
+		// StreamType, StreamID, EventID, CreatedAt are defaulted automatically if omitted
+		return []store.Event{
+			{EventType: "UserEmailChanged", Payload: payload},
+		}, nil
+	},
+	snapshot.EveryNEvents(100), // Snapshot policy
+)
 if err != nil {
 	return err
-}
-user := res.State
-
-// ... Execute business logic producing events ...
-
-// Commit events to the event store
-result, err := eventStore.Append(ctx, tx, store.Exact(res.StreamVersion), newEvents)
-if err != nil {
-	return err
-}
-
-// Snapshot policy trigger (e.g. every 100 events)
-policy := snapshot.EveryNEvents(100)
-if res.ShouldSnapshot(policy, int64(len(newEvents))) {
-	err = userRepo.Save(ctx, tx, userID, result.ToVersion(), user)
-	if err != nil {
-		return err
-	}
 }
 
 return tx.Commit(ctx)
 ```
+
+#### Pattern B: Explicit Append & Append-Safe Save with `SaveAppended`
+
+If you prefer to manage the event store `Append` call manually, use `SaveAppended`. This helper automatically folds the newly appended events into `res.State` before saving the snapshot, eliminating the risk of persisting pre-append state:
+
+```go
+tx, err := db.Begin(ctx)
+if err != nil {
+	return err
+}
+defer tx.Rollback(ctx)
+
+// 1. Load rehydrates state from snapshot + delta events
+res, err := userRepo.Load(ctx, tx, userID)
+if err != nil {
+	return err
+}
+
+// 2. Business logic produces new events
+// ...
+
+// 3. Append to event store
+appendRes, err := eventStore.Append(ctx, tx, store.Exact(res.StreamVersion), newEvents)
+if err != nil {
+	return err
+}
+
+// 4. Save snapshot safely: folds newly appended events into res.State before saving
+policy := snapshot.EveryNEvents(100)
+if res.ShouldSnapshot(policy, int64(len(newEvents))) {
+	updatedUser, err := userRepo.SaveAppended(ctx, tx, userID, res.State, appendRes)
+	if err != nil {
+		return err
+	}
+	_ = updatedUser
+}
+
+return tx.Commit(ctx)
+```
+
+> [!WARNING]
+> **Append-Safe Snapshot Rule**: Never call `Save(ctx, tx, id, appendRes.ToVersion(), res.State)` using pre-append `res.State`! Pre-append state lacks the newly appended events, causing silent state regression on subsequent loads. Always use `Execute` or `SaveAppended`.
 
 ## Best Practices & Architecture Details
 

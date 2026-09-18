@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/eventsalsa/store"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -261,4 +262,146 @@ func (r *Repository[T]) Save(ctx context.Context, tx pgx.Tx, id string, version 
 	}
 
 	return nil
+}
+
+// SaveAppended applies the events from an append result to the provided state
+// and persists a snapshot of the updated state at the new stream version.
+//
+// This helper guarantees that newly appended events are folded into the in-memory
+// state before the snapshot is serialized and persisted, preventing the critical
+// data loss trap where a snapshot is saved with a new version but stale pre-append state.
+func (r *Repository[T]) SaveAppended(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+	state T,
+	result store.AppendResult,
+) (T, error) {
+	var err error
+	for i := range result.Events {
+		state, err = r.config.Apply(state, result.Events[i])
+		if err != nil {
+			return state, fmt.Errorf("failed to apply appended event v%d: %w", result.Events[i].StreamVersion, err)
+		}
+	}
+
+	if len(result.Events) == 0 {
+		return state, nil
+	}
+
+	err = r.Save(ctx, tx, id, result.ToVersion(), state)
+	if err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+// HandlerFunc represents a domain command handler that takes the current aggregate state
+// and stream version, and returns new events to append to the stream.
+type HandlerFunc[T any] func(state T, version int64) ([]store.Event, error)
+
+func (r *Repository[T]) prepareEvents(id string, events []store.Event) error {
+	for i := range events {
+		if events[i].StreamType == "" {
+			events[i].StreamType = r.config.StreamType
+		} else if events[i].StreamType != r.config.StreamType {
+			return fmt.Errorf("event %d stream type %q does not match repository stream type %q", i, events[i].StreamType, r.config.StreamType)
+		}
+		if events[i].StreamID == "" {
+			events[i].StreamID = id
+		} else if events[i].StreamID != id {
+			return fmt.Errorf("event %d stream id %q does not match target id %q", i, events[i].StreamID, id)
+		}
+		if events[i].EventID == uuid.Nil {
+			events[i].EventID = uuid.New()
+		}
+		if events[i].CreatedAt.IsZero() {
+			events[i].CreatedAt = time.Now()
+		}
+	}
+	return nil
+}
+
+// Execute coordinates the complete load-handle-append-snapshot cycle in a single transaction:
+// 1. Loads the latest stream state and metadata via Load.
+// 2. Invokes the handler function with the current state and version.
+// 3. If handler returns no events and no error, returns early without appending.
+// 4. Appends the events to the event store using store.Exact(version) (or store.NoStream for v0).
+// 5. Folds newly appended events into the state using Apply.
+// 6. Evaluates the snapshot policy and, if triggered, persists the updated state snapshot.
+// 7. Returns the final Result[T] and store.AppendResult.
+func (r *Repository[T]) Execute(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+	eventStore store.EventStore,
+	handler HandlerFunc[T],
+	policy Policy,
+) (Result[T], store.AppendResult, error) {
+	if eventStore == nil {
+		return Result[T]{}, store.AppendResult{}, fmt.Errorf("event store cannot be nil")
+	}
+	if handler == nil {
+		return Result[T]{}, store.AppendResult{}, fmt.Errorf("handler cannot be nil")
+	}
+
+	loadRes, err := r.Load(ctx, tx, id)
+	if err != nil {
+		return Result[T]{}, store.AppendResult{}, fmt.Errorf("failed to load stream: %w", err)
+	}
+
+	events, err := handler(loadRes.State, loadRes.StreamVersion)
+	if err != nil {
+		return Result[T]{}, store.AppendResult{}, fmt.Errorf("handler error: %w", err)
+	}
+
+	if len(events) == 0 {
+		return loadRes, store.AppendResult{}, nil
+	}
+
+	if prepErr := r.prepareEvents(id, events); prepErr != nil {
+		return Result[T]{}, store.AppendResult{}, prepErr
+	}
+
+	var expectedVersion store.ExpectedVersion
+	if loadRes.StreamVersion == 0 {
+		expectedVersion = store.NoStream()
+	} else {
+		expectedVersion = store.Exact(loadRes.StreamVersion)
+	}
+
+	appendRes, err := eventStore.Append(ctx, tx, expectedVersion, events)
+	if err != nil {
+		return Result[T]{}, store.AppendResult{}, fmt.Errorf("failed to append events: %w", err)
+	}
+
+	currentState := loadRes.State
+	for i := range appendRes.Events {
+		currentState, err = r.config.Apply(currentState, appendRes.Events[i])
+		if err != nil {
+			return Result[T]{}, appendRes, fmt.Errorf("failed to apply appended event v%d: %w", appendRes.Events[i].StreamVersion, err)
+		}
+	}
+
+	finalVersion := appendRes.ToVersion()
+	res := Result[T]{
+		State:           currentState,
+		StreamVersion:   finalVersion,
+		SnapshotVersion: loadRes.SnapshotVersion,
+		SnapshotHit:     loadRes.SnapshotHit,
+		SchemaVersion:   r.config.SchemaVersion,
+		EventsReplayed:  loadRes.EventsReplayed + len(events),
+	}
+
+	if loadRes.ShouldSnapshot(policy, int64(len(events))) {
+		err = r.Save(ctx, tx, id, finalVersion, currentState)
+		if err != nil {
+			return Result[T]{}, appendRes, fmt.Errorf("failed to save snapshot: %w", err)
+		}
+		res.SnapshotVersion = finalVersion
+		res.SnapshotHit = true
+		res.EventsReplayed = 0
+	}
+
+	return res, appendRes, nil
 }
