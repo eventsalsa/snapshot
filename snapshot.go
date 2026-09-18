@@ -33,11 +33,17 @@ type Result[T any] struct {
 	// EventsReplayed is the number of delta events replayed from the event store.
 	EventsReplayed int
 
-	// SchemaVersion is the schema version of the snapshot that was loaded (0 if none was used).
+	// SchemaVersion is the schema version of the rehydrated state (0 if miss).
 	SchemaVersion int
 
-	// SnapshotHit is true if a valid snapshot matching the configured schema version was loaded and used.
+	// SnapshotSchemaVersion is the raw schema version of the snapshot row loaded from storage (0 if miss).
+	SnapshotSchemaVersion int
+
+	// SnapshotHit is true if a valid snapshot (either matching or upcasted) was loaded and used.
 	SnapshotHit bool
+
+	// Upcasted is true if the snapshot was migrated from an older schema version using configured upcasters.
+	Upcasted bool
 }
 
 // Data returns the rehydrated stream state (alias for State).
@@ -77,49 +83,32 @@ func (r Result[T]) ShouldSnapshot(policy Policy, appendedCount int64) bool {
 	return policy(r.StreamVersion, r.SnapshotVersion, appendedCount)
 }
 
+// Upcaster transforms raw snapshot payload bytes from one schema version to the next schema version.
+// For example, an upcaster registered for version 1 transforms a schema version 1 payload into a schema version 2 payload.
+type Upcaster func(fromSchemaVersion int, payload []byte) ([]byte, error)
+
 // Store defines the low-level persistence interface for snapshots.
 type Store interface {
-	// Get retrieves the latest snapshot for the given stream.
+	// Get retrieves the snapshot for the given stream with the highest schema version <= maxSchemaVersion.
+	// If maxSchemaVersion <= 0, it retrieves the latest snapshot without schema version filtering.
 	// Returns a zero Snapshot and nil if no snapshot exists.
-	Get(ctx context.Context, tx pgx.Tx, streamType, streamID string) (Snapshot, error)
+	Get(ctx context.Context, tx pgx.Tx, streamType, streamID string, maxSchemaVersion int) (Snapshot, error)
 
-	// Put saves (inserts or updates) a snapshot for the stream.
-	// Overwrites the existing snapshot if it already exists for the (type, id) pair.
+	// Put saves (inserts or updates) a snapshot for the stream and schema version.
+	// Preserves monotonicity for the (stream_type, stream_id, schema_version) tuple.
 	Put(ctx context.Context, tx pgx.Tx, snapshot *Snapshot) error
 }
 
 // RepositoryConfig contains configuration for the generic Repository.
 type RepositoryConfig[T any] struct {
-	// Logger is an optional logger for observability.
-	// If nil, logging is disabled (zero overhead).
-	Logger store.Logger
-
-	// Initializer instantiates a new, empty stream state for a given ID.
-	Initializer func(id string) T
-
-	// Apply applies a single persisted event to update the stream state.
-	// It must return the updated state (which can be the mutated input state).
-	Apply func(state T, event store.PersistedEvent) (T, error)
-
-	// Marshal serializes the stream state into raw bytes for snapshot storage.
-	Marshal func(state T) ([]byte, error)
-
-	// Unmarshal deserializes raw snapshot bytes back into the stream state.
-	Unmarshal func(data []byte) (T, error)
-
-	// StreamType is the string identifier for the stream type (e.g. "User").
-	StreamType string
-
-	// SchemaVersion is the current version of the stream struct/logic schema.
-	// Must be a positive integer (>= 1); version 0 is reserved for uninitialized configuration.
-	// If a stored snapshot has a different SchemaVersion, it is ignored
-	// and the stream is rehydrated from version 1 of the event log.
-	SchemaVersion int
-
-	// FailOnCorruptSnapshot determines whether an unmarshaling error on a snapshot
-	// payload immediately fails Load (true), or safely discards the snapshot and
-	// falls back to replaying the full stream of events from version 1 (false).
-	// Defaults to false (resilient fallback).
+	Logger                store.Logger
+	Initializer           func(id string) T
+	Apply                 func(state T, event store.PersistedEvent) (T, error)
+	Marshal               func(state T) ([]byte, error)
+	Unmarshal             func(data []byte) (T, error)
+	Upcasters             map[int]Upcaster
+	StreamType            string
+	SchemaVersion         int
 	FailOnCorruptSnapshot bool
 }
 
@@ -161,6 +150,17 @@ func NewRepository[T any](
 	if config.SchemaVersion <= 0 {
 		return nil, fmt.Errorf("schema version must be >= 1 (got %d); version 0 is reserved for uninitialized configuration", config.SchemaVersion)
 	}
+	for v, u := range config.Upcasters {
+		if v <= 0 {
+			return nil, fmt.Errorf("upcaster source schema version must be >= 1 (got %d)", v)
+		}
+		if v >= config.SchemaVersion {
+			return nil, fmt.Errorf("upcaster source schema version %d cannot be >= repository schema version %d", v, config.SchemaVersion)
+		}
+		if u == nil {
+			return nil, fmt.Errorf("nil upcaster configured for schema version %d", v)
+		}
+	}
 	return &Repository[T]{
 		reader:        reader,
 		snapshotStore: snapshotStore,
@@ -169,13 +169,12 @@ func NewRepository[T any](
 }
 
 // Load rehydrates the stream state up to its current version.
-// First, it attempts to load the latest snapshot. If a valid snapshot is found
-// matching the configured SchemaVersion, it deserializes the state and reads
-// newer events starting from version S + 1. Otherwise, it initializes a new state
-// and reads all events from the beginning.
+// First, it attempts to load the latest snapshot <= current SchemaVersion. If a valid
+// snapshot is found matching or upcastable to the configured SchemaVersion, it
+// deserializes the state and reads newer events starting from version S + 1.
+// Otherwise, it initializes a new state and reads all events from the beginning.
 func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Result[T], err error) {
-	var snap Snapshot
-	snap, err = r.snapshotStore.Get(ctx, tx, r.config.StreamType, id)
+	snap, err := r.snapshotStore.Get(ctx, tx, r.config.StreamType, id, r.config.SchemaVersion)
 	if err != nil {
 		return res, fmt.Errorf("failed to load snapshot: %w", err)
 	}
@@ -184,34 +183,29 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Res
 	var initialized bool
 	var version int64
 
-	// Check if we have a valid snapshot matching the current schema version
-	if snap.StreamVersion > 0 && snap.SchemaVersion == r.config.SchemaVersion {
-		res.State, err = r.config.Unmarshal(snap.Payload)
-		if err != nil {
-			if r.config.FailOnCorruptSnapshot {
-				return res, fmt.Errorf("failed to unmarshal snapshot: %w", err)
-			}
-			if r.config.Logger != nil {
-				r.config.Logger.Error(ctx, "failed to unmarshal snapshot payload; falling back to full stream replay",
-					"stream_type", r.config.StreamType,
-					"stream_id", id,
-					"stream_version", snap.StreamVersion,
-					"schema_version", snap.SchemaVersion,
-					"error", err)
-			}
-		} else {
+	if snap.StreamVersion > 0 {
+		state, ok, upcasted, snapErr := r.resolveSnapshot(ctx, id, &snap)
+		if snapErr != nil {
+			return res, snapErr
+		}
+		if ok {
+			res.State = state
+			res.SnapshotHit = true
+			res.SnapshotVersion = snap.StreamVersion
+			res.SnapshotSchemaVersion = snap.SchemaVersion
+			res.SchemaVersion = r.config.SchemaVersion
+			res.Upcasted = upcasted
 			version = snap.StreamVersion
 			nextVersion := snap.StreamVersion + 1
 			fromVersion = &nextVersion
 			initialized = true
-			res.SnapshotHit = true
-			res.SnapshotVersion = snap.StreamVersion
-			res.SchemaVersion = snap.SchemaVersion
 		}
 	}
 
 	if !initialized {
 		res.State = r.config.Initializer(id)
+		res.SnapshotSchemaVersion = 0
+		res.Upcasted = false
 		version = 0
 		fromVersion = nil
 	}
@@ -231,7 +225,9 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Res
 			res.State = r.config.Initializer(id)
 			res.SnapshotHit = false
 			res.SnapshotVersion = 0
+			res.SnapshotSchemaVersion = 0
 			res.SchemaVersion = 0
+			res.Upcasted = false
 			version = 0
 			stream = fullStream
 		}
@@ -249,6 +245,88 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Res
 	res.EventsReplayed = len(stream.Events)
 
 	return res, nil
+}
+
+func (r *Repository[T]) resolveSnapshot(ctx context.Context, id string, snap *Snapshot) (state T, ok, upcasted bool, err error) {
+	var payload []byte
+	var zero T
+
+	switch {
+	case snap.SchemaVersion == r.config.SchemaVersion:
+		payload = snap.Payload
+	case snap.SchemaVersion < r.config.SchemaVersion:
+		var chainOK bool
+		payload, chainOK, err = r.upcastPayload(ctx, id, snap)
+		if err != nil {
+			return zero, false, false, err
+		}
+		if !chainOK {
+			return zero, false, false, nil
+		}
+		upcasted = true
+	default:
+		return zero, false, false, nil
+	}
+
+	state, err = r.config.Unmarshal(payload)
+	if err != nil {
+		if r.config.FailOnCorruptSnapshot {
+			return zero, false, false, fmt.Errorf("failed to unmarshal snapshot: %w", err)
+		}
+		if r.config.Logger != nil {
+			r.config.Logger.Error(ctx, "failed to unmarshal snapshot payload; falling back to full stream replay",
+				"stream_type", r.config.StreamType,
+				"stream_id", id,
+				"stream_version", snap.StreamVersion,
+				"schema_version", snap.SchemaVersion,
+				"error", err,
+			)
+		}
+		return zero, false, false, nil
+	}
+
+	return state, true, upcasted, nil
+}
+
+func (r *Repository[T]) upcastPayload(ctx context.Context, id string, snap *Snapshot) (payload []byte, complete bool, err error) {
+	currentPayload := snap.Payload
+	currentVer := snap.SchemaVersion
+
+	for currentVer < r.config.SchemaVersion {
+		upcaster, ok := r.config.Upcasters[currentVer]
+		if !ok {
+			if r.config.Logger != nil {
+				r.config.Logger.Debug(ctx, "no upcaster found in chain; falling back to full stream replay",
+					"stream_type", r.config.StreamType,
+					"stream_id", id,
+					"current_schema_version", currentVer,
+					"target_schema_version", r.config.SchemaVersion,
+				)
+			}
+			return nil, false, nil
+		}
+
+		var err error
+		currentPayload, err = upcaster(currentVer, currentPayload)
+		if err != nil {
+			if r.config.FailOnCorruptSnapshot {
+				return nil, false, fmt.Errorf("failed to upcast snapshot from schema version %d: %w", currentVer, err)
+			}
+			if r.config.Logger != nil {
+				r.config.Logger.Error(ctx, "failed to upcast snapshot payload; falling back to full stream replay",
+					"stream_type", r.config.StreamType,
+					"stream_id", id,
+					"from_schema_version", currentVer,
+					"to_schema_version", currentVer+1,
+					"error", err,
+				)
+			}
+			return nil, false, nil
+		}
+		currentVer++
+	}
+
+	return currentPayload, true, nil
 }
 
 func (r *Repository[T]) verifySnapshotInStream(ctx context.Context, tx pgx.Tx, id string, snap *Snapshot) (store.Stream, bool, error) {

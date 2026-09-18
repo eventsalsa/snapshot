@@ -11,7 +11,8 @@ It is designed to be used alongside [`github.com/eventsalsa/store`](https://gith
 
 - **Generic & Type-Safe**: Uses Go generics (`[T any]`) to define repositories, avoiding any coupling or structural inheritance inside your stream state types.
 - **Pgx Transactional Integrity**: All operations run within caller-provided `pgx.Tx` transactions, matching the design of `eventsalsa/store`.
-- **Automatic Schema Evolution**: Includes a `schema_version` column. If the snapshot stored in the database has a schema version that mismatches the code's expected version, the repository automatically discards it and falls back to a full replay of events from version 1.
+- **Compound Primary Key & Multi-Version Rolling Deploys**: Primary key `(stream_type, stream_id, schema_version)` allows older and newer application versions to read and write their own snapshots concurrently without overwriting each other.
+- **Sequential In-Memory Upcasters**: Convert older snapshot payloads on read via `Upcasters: map[int]Upcaster` to eliminate $O(N)$ event replay spikes during schema version migrations.
 - **Resilient Fallback**: Discards corrupt or unparseable snapshot payloads and recovers automatically via event log replay.
 - **Append-Safe Persistence**: Provides `SaveAppended` to fold newly appended events into aggregate state before snapshot write, preventing state regression.
 - **Low-Level and High-Level APIs**: Exposes a raw byte `Store` interface alongside a high-level `Repository[T]`.
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     payload BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
-    PRIMARY KEY (stream_type, stream_id)
+    PRIMARY KEY (stream_type, stream_id, schema_version)
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_schema_version 
@@ -143,11 +144,14 @@ if err != nil {
 }
 
 // res contains:
-// - res.State:           the rehydrated *UserState
-// - res.StreamVersion:   current stream version (e.g. 150)
-// - res.SnapshotVersion: version where snapshot was loaded from (e.g. 100, or 0 if miss)
-// - res.SnapshotHit:     true if a matching snapshot was used
-// - res.EventsReplayed:  number of delta events read and applied (e.g. 50)
+// - res.State:                 the rehydrated *UserState
+// - res.StreamVersion:         current stream version after delta replay (e.g. 150)
+// - res.SnapshotVersion:       version where snapshot was loaded from (e.g. 100, or 0 if miss)
+// - res.SnapshotHit:           true if a valid snapshot was used
+// - res.EventsReplayed:        number of delta events read and applied (e.g. 50)
+// - res.SchemaVersion:         target schema version (e.g. 2)
+// - res.SnapshotSchemaVersion: raw schema version of the loaded snapshot (e.g. 1, or 0 if miss)
+// - res.Upcasted:              true if an older snapshot was migrated via upcasters
 ```
 
 #### Saving Snapshots
@@ -200,11 +204,11 @@ return tx.Commit(ctx)
 
 ### Schema Versioning & Stream Evolution
 
-When your stream state struct shape changes in backwards-incompatible ways:
+When your stream state struct shape changes across versions:
 1. Increment the `SchemaVersion` integer in your `RepositoryConfig`.
-2. When loading state, the repository detects that the stored snapshot's `schema_version` does not match `SchemaVersion`.
-3. It safely discards the snapshot and replays the entire event stream from version 1.
-4. When a new snapshot is saved, it writes the updated `schema_version` and serialized payload.
+2. Configure sequential `Upcasters: map[int]Upcaster` to transform older payloads (e.g., version 1 to 2, 2 to 3) on the fly without reading the event log from scratch.
+3. If an upcaster in the chain is missing or encounters an error, the repository safely falls back to replaying the entire event stream from version 1.
+4. During rolling deployments, older and newer service instances operate simultaneously against the compound primary key `(stream_type, stream_id, schema_version)` without overwriting each other's snapshots.
 
 ### Decoupled Encryption
 
