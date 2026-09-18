@@ -133,21 +133,23 @@ if err != nil {
 defer tx.Rollback(ctx)
 
 // Load rehydrates state from snapshot + delta events
-user, version, err := userRepo.Load(ctx, tx, userID)
+res, err := userRepo.Load(ctx, tx, userID)
 if err != nil {
 	return err
 }
+user := res.State
 
 // ... Execute business logic producing events ...
 
 // Commit events to the event store
-result, err := eventStore.Append(ctx, tx, store.Exact(version), newEvents)
+result, err := eventStore.Append(ctx, tx, store.Exact(res.StreamVersion), newEvents)
 if err != nil {
 	return err
 }
 
-// Manual/Explicit snapshot trigger (e.g. every 100 events)
-if result.ToVersion() % 100 == 0 {
+// Snapshot policy trigger (e.g. every 100 events)
+policy := snapshot.EveryNEvents(100)
+if res.ShouldSnapshot(policy, int64(len(newEvents))) {
 	err = userRepo.Save(ctx, tx, userID, result.ToVersion(), user)
 	if err != nil {
 		return err
