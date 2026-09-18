@@ -5,7 +5,6 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"testing"
 	"time"
 
@@ -531,11 +530,27 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 		t.Fatalf("failed to write corrupt snapshot: %v", err)
 	}
 
-	// Now try to load. It should fail to unmarshal and return a wrapped JSON unmarshal error
-	_, _, err = repo.Load(ctx, tx, id)
+	// In default resilient mode, Load discards corrupt snapshot and falls back to full replay
+	user, version, err := repo.Load(ctx, tx, id)
+	if err != nil {
+		t.Errorf("expected resilient load fallback, got error: %v", err)
+	}
+	if version != 0 {
+		t.Errorf("expected version 0 (empty stream), got %d", version)
+	}
+	if user.ID != id {
+		t.Errorf("expected user ID %q, got %q", id, user.ID)
+	}
+
+	// In strict mode (FailOnCorruptSnapshot: true), Load returns the unmarshal error
+	strictConfig := config
+	strictConfig.FailOnCorruptSnapshot = true
+	strictRepo, err := snapshot.NewRepository(es, ss, strictConfig)
+	if err != nil {
+		t.Fatalf("create strict repository: %v", err)
+	}
+	_, _, err = strictRepo.Load(ctx, tx, id)
 	if err == nil {
-		t.Error("expected load error due to corrupt JSON unmarshal")
-	} else if !errors.Is(err, err) { // Verify it contains wrapping
-		t.Logf("got expected error: %v", err)
+		t.Error("expected load error in strict mode due to corrupt JSON unmarshal")
 	}
 }

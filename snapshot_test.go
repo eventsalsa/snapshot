@@ -53,6 +53,20 @@ func (m *mockSnapshotStore) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.S
 	return nil
 }
 
+type mockLogger struct {
+	debugCalls int
+	infoCalls  int
+	errorCalls int
+	lastErrMsg string
+}
+
+func (m *mockLogger) Debug(_ context.Context, _ string, _ ...any) { m.debugCalls++ }
+func (m *mockLogger) Info(_ context.Context, _ string, _ ...any)  { m.infoCalls++ }
+func (m *mockLogger) Error(_ context.Context, msg string, _ ...any) {
+	m.errorCalls++
+	m.lastErrMsg = msg
+}
+
 func defaultTestConfig() snapshot.RepositoryConfig[*userState] {
 	return snapshot.RepositoryConfig[*userState]{
 		StreamType:    "User",
@@ -260,8 +274,72 @@ func TestRepository_Load(t *testing.T) {
 		}
 	})
 
-	t.Run("snapshot unmarshal error", func(t *testing.T) {
+	t.Run("snapshot unmarshal error fallback by default", func(t *testing.T) {
+		logger := &mockLogger{}
 		cfg := defaultTestConfig()
+		cfg.Logger = logger
+
+		snapStore := &mockSnapshotStore{
+			getFunc: func(_ context.Context, _ pgx.Tx, _, _ string) (snapshot.Snapshot, error) {
+				return snapshot.Snapshot{
+					StreamType:    "User",
+					StreamID:      "user-1",
+					StreamVersion: 5,
+					SchemaVersion: 1,
+					Payload:       []byte("invalid-json"),
+				}, nil
+			},
+		}
+
+		var requestedFromVersion *int64
+		reader := &mockStreamReader{
+			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, fromVersion, _ *int64) (store.Stream, error) {
+				requestedFromVersion = fromVersion
+				evPayload, err := json.Marshal(userEvent{Name: "Bob"})
+				if err != nil {
+					return store.Stream{}, err
+				}
+				return store.Stream{
+					StreamType: streamType,
+					StreamID:   streamID,
+					Events: []store.PersistedEvent{
+						{
+							StreamType:    streamType,
+							StreamID:      streamID,
+							StreamVersion: 1,
+							Payload:       evPayload,
+						},
+					},
+				}, nil
+			},
+		}
+
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository failed: %v", err)
+		}
+		state, version, err := repo.Load(ctx, nil, "user-1")
+		if err != nil {
+			t.Fatalf("expected fallback to succeed, got error: %v", err)
+		}
+		if requestedFromVersion != nil {
+			t.Errorf("expected fromVersion to be nil for full replay, got %v", *requestedFromVersion)
+		}
+		if version != 1 {
+			t.Errorf("expected version 1, got %d", version)
+		}
+		if state.Name != "Bob" {
+			t.Errorf("expected state name 'Bob', got %q", state.Name)
+		}
+		if logger.errorCalls == 0 {
+			t.Errorf("expected logger.Error to be called on corrupt snapshot payload")
+		}
+	})
+
+	t.Run("snapshot unmarshal error with FailOnCorruptSnapshot", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		cfg.FailOnCorruptSnapshot = true
+
 		snapStore := &mockSnapshotStore{
 			getFunc: func(_ context.Context, _ pgx.Tx, _, _ string) (snapshot.Snapshot, error) {
 				return snapshot.Snapshot{
@@ -280,7 +358,7 @@ func TestRepository_Load(t *testing.T) {
 		}
 		_, _, err = repo.Load(ctx, nil, "user-1")
 		if err == nil {
-			t.Fatal("expected error on invalid json payload, got nil")
+			t.Fatal("expected error on invalid json payload when FailOnCorruptSnapshot=true, got nil")
 		}
 	})
 
