@@ -123,13 +123,13 @@ func main() {
 		log.Fatalf("Failed to begin tx: %v", err)
 	}
 
-	u, version, err := repo.Load(ctx, tx, userID)
+	res, err := repo.Load(ctx, tx, userID)
 	if err != nil {
 		log.Fatalf("Load failed: %v", err)
 	}
 	_ = tx.Rollback(ctx)
 
-	fmt.Printf("Loaded state: %+v, version: %d\n", u, version)
+	fmt.Printf("Loaded state: %+v, version: %d\n", res.State, res.StreamVersion)
 
 	// --- Step 2: Save Event 1 (UserCreated) ---
 	fmt.Println("\n--- Step 2: Appending UserCreated event ---")
@@ -193,14 +193,14 @@ func main() {
 		log.Fatalf("Failed to begin tx: %v", err)
 	}
 
-	u, version, err = repo.Load(ctx, tx, userID)
+	res, err = repo.Load(ctx, tx, userID)
 	if err != nil {
 		log.Fatalf("Load failed: %v", err)
 	}
 
-	fmt.Printf("Materialized state for snapshot: %+v (v%d)\n", u, version)
+	fmt.Printf("Materialized state for snapshot: %+v (v%d)\n", res.State, res.StreamVersion)
 
-	err = repo.Save(ctx, tx, userID, version, u)
+	err = repo.Save(ctx, tx, userID, res.StreamVersion, res.State)
 	if err != nil {
 		log.Fatalf("Save snapshot failed: %v", err)
 	}
@@ -214,6 +214,7 @@ func main() {
 		log.Fatalf("Failed to begin tx: %v", err)
 	}
 
+	version := res.StreamVersion
 	names := []string{"Alice S.", "Alice Smith"}
 	for _, name := range names {
 		payload, _ = json.Marshal(UserNameChanged{Name: name})
@@ -227,11 +228,11 @@ func main() {
 				CreatedAt:  time.Now(),
 			},
 		}
-		res, err := eventStore.Append(ctx, tx, store.Exact(version), ev)
+		appendRes, err := eventStore.Append(ctx, tx, store.Exact(version), ev)
 		if err != nil {
 			log.Fatalf("Append failed: %v", err)
 		}
-		version = res.ToVersion()
+		version = appendRes.ToVersion()
 	}
 	_ = tx.Commit(ctx)
 	fmt.Printf("User is now at version: %d\n", version)
@@ -243,13 +244,13 @@ func main() {
 		log.Fatalf("Failed to begin tx: %v", err)
 	}
 
-	u, version, err = repo.Load(ctx, tx, userID)
+	res, err = repo.Load(ctx, tx, userID)
 	if err != nil {
 		log.Fatalf("Load failed: %v", err)
 	}
 	_ = tx.Rollback(ctx)
 
-	fmt.Printf("Rehydrated state: %+v, final version: %d\n", u, version)
+	fmt.Printf("Rehydrated state: %+v, final version: %d (snapshot hit: %v, replayed: %d)\n", res.State, res.StreamVersion, res.SnapshotHit, res.EventsReplayed)
 
 	// --- Step 7: Simulate Schema Migration (SchemaVersion bumped to 2) ---
 	fmt.Println("\n--- Step 7: Simulating Schema Version Mismatch (bumping SchemaVersion to 2) ---")
@@ -264,13 +265,13 @@ func main() {
 
 	// This load should detect that the stored snapshot has SchemaVersion 1,
 	// discard it, and replay all events (v1 -> v7) from scratch.
-	u, version, err = repo2.Load(ctx, tx, userID)
+	res, err = repo2.Load(ctx, tx, userID)
 	if err != nil {
 		log.Fatalf("Load with schema v2 failed: %v", err)
 	}
 	_ = tx.Rollback(ctx)
 
-	fmt.Printf("Rehydrated state (all replayed): %+v, final version: %d\n", u, version)
+	fmt.Printf("Rehydrated state (all replayed): %+v, final version: %d (snapshot hit: %v, replayed: %d)\n", res.State, res.StreamVersion, res.SnapshotHit, res.EventsReplayed)
 }
 
 func setupTables(ctx context.Context, db *pgxpool.Pool) {

@@ -244,15 +244,15 @@ func TestRepository_Load(t *testing.T) {
 			t.Fatalf("new repository: %v", err)
 		}
 
-		state, version, err := repo.Load(ctx, nil, "user-1")
+		res, err := repo.Load(ctx, nil, "user-1")
 		if err != nil {
 			t.Fatalf("Load failed: %v", err)
 		}
-		if version != 0 {
-			t.Errorf("expected version 0, got %d", version)
+		if res.StreamVersion != 0 {
+			t.Errorf("expected version 0, got %d", res.StreamVersion)
 		}
-		if state.ID != "user-1" {
-			t.Errorf("expected ID 'user-1', got %s", state.ID)
+		if res.State.ID != "user-1" {
+			t.Errorf("expected ID 'user-1', got %s", res.State.ID)
 		}
 	})
 
@@ -268,7 +268,7 @@ func TestRepository_Load(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
-		_, _, err = repo.Load(ctx, nil, "user-1")
+		_, err = repo.Load(ctx, nil, "user-1")
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -318,18 +318,18 @@ func TestRepository_Load(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
-		state, version, err := repo.Load(ctx, nil, "user-1")
+		res, err := repo.Load(ctx, nil, "user-1")
 		if err != nil {
 			t.Fatalf("expected fallback to succeed, got error: %v", err)
 		}
 		if requestedFromVersion != nil {
 			t.Errorf("expected fromVersion to be nil for full replay, got %v", *requestedFromVersion)
 		}
-		if version != 1 {
-			t.Errorf("expected version 1, got %d", version)
+		if res.StreamVersion != 1 {
+			t.Errorf("expected version 1, got %d", res.StreamVersion)
 		}
-		if state.Name != "Bob" {
-			t.Errorf("expected state name 'Bob', got %q", state.Name)
+		if res.State.Name != "Bob" {
+			t.Errorf("expected state name 'Bob', got %q", res.State.Name)
 		}
 		if logger.errorCalls == 0 {
 			t.Errorf("expected logger.Error to be called on corrupt snapshot payload")
@@ -356,7 +356,7 @@ func TestRepository_Load(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
-		_, _, err = repo.Load(ctx, nil, "user-1")
+		_, err = repo.Load(ctx, nil, "user-1")
 		if err == nil {
 			t.Fatal("expected error on invalid json payload when FailOnCorruptSnapshot=true, got nil")
 		}
@@ -407,18 +407,18 @@ func TestRepository_Load(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
-		state, version, err := repo.Load(ctx, nil, "user-1")
+		res, err := repo.Load(ctx, nil, "user-1")
 		if err != nil {
 			t.Fatalf("Load failed: %v", err)
 		}
 		if requestedFromVersion == nil || *requestedFromVersion != 4 {
 			t.Fatalf("expected fromVersion 4, got %v", requestedFromVersion)
 		}
-		if version != 4 {
-			t.Errorf("expected final version 4, got %d", version)
+		if res.StreamVersion != 4 {
+			t.Errorf("expected final version 4, got %d", res.StreamVersion)
 		}
-		if state.Name != "Alice Smith" || state.Email != "alice@example.com" {
-			t.Errorf("unexpected state: %+v", state)
+		if res.State.Name != "Alice Smith" || res.State.Email != "alice@example.com" {
+			t.Errorf("unexpected state: %+v", res.State)
 		}
 	})
 
@@ -469,18 +469,18 @@ func TestRepository_Load(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
-		state, version, err := repo.Load(ctx, nil, "user-1")
+		res, err := repo.Load(ctx, nil, "user-1")
 		if err != nil {
 			t.Fatalf("Load failed: %v", err)
 		}
 		if requestedFromVersion != nil {
 			t.Errorf("expected fromVersion nil (replay from beginning), got %v", requestedFromVersion)
 		}
-		if version != 2 {
-			t.Errorf("expected version 2, got %d", version)
+		if res.StreamVersion != 2 {
+			t.Errorf("expected version 2, got %d", res.StreamVersion)
 		}
-		if state.Name != "Alice S." {
-			t.Errorf("expected Name 'Alice S.', got %s", state.Name)
+		if res.State.Name != "Alice S." {
+			t.Errorf("expected Name 'Alice S.', got %s", res.State.Name)
 		}
 	})
 
@@ -496,7 +496,7 @@ func TestRepository_Load(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
-		_, _, err = repo.Load(ctx, nil, "user-1")
+		_, err = repo.Load(ctx, nil, "user-1")
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -519,7 +519,7 @@ func TestRepository_Load(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
-		_, _, err = repo.Load(ctx, nil, "user-1")
+		_, err = repo.Load(ctx, nil, "user-1")
 		if err == nil {
 			t.Fatal("expected error from Apply, got nil")
 		}
@@ -617,6 +617,210 @@ func TestRepository_Save(t *testing.T) {
 		}
 		if decoded.Name != "Alice" {
 			t.Errorf("expected payload name 'Alice', got %s", decoded.Name)
+		}
+	})
+}
+
+func TestRepository_Load_Result(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("snapshot hit with delta events", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		snapPayload, err := json.Marshal(&userState{ID: "user-1", Name: "Alice"})
+		if err != nil {
+			t.Fatalf("marshal failed: %v", err)
+		}
+		snapStore := &mockSnapshotStore{
+			getFunc: func(_ context.Context, _ pgx.Tx, _, _ string) (snapshot.Snapshot, error) {
+				return snapshot.Snapshot{
+					StreamType:    "User",
+					StreamID:      "user-1",
+					StreamVersion: 3,
+					SchemaVersion: 1,
+					Payload:       snapPayload,
+				}, nil
+			},
+		}
+		reader := &mockStreamReader{
+			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _, _ *int64) (store.Stream, error) {
+				evPayload, err := json.Marshal(userEvent{Email: "alice@example.com"})
+				if err != nil {
+					return store.Stream{}, err
+				}
+				return store.Stream{
+					StreamType: streamType,
+					StreamID:   streamID,
+					Events: []store.PersistedEvent{
+						{StreamType: streamType, StreamID: streamID, StreamVersion: 4, Payload: evPayload},
+						{StreamType: streamType, StreamID: streamID, StreamVersion: 5, Payload: evPayload},
+					},
+				}, nil
+			},
+		}
+
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository failed: %v", err)
+		}
+		res, err := repo.Load(ctx, nil, "user-1")
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		if !res.SnapshotHit {
+			t.Errorf("expected SnapshotHit to be true")
+		}
+		if res.SnapshotVersion != 3 {
+			t.Errorf("expected SnapshotVersion 3, got %d", res.SnapshotVersion)
+		}
+		if res.SchemaVersion != 1 {
+			t.Errorf("expected SchemaVersion 1, got %d", res.SchemaVersion)
+		}
+		if res.StreamVersion != 5 {
+			t.Errorf("expected StreamVersion 5, got %d", res.StreamVersion)
+		}
+		if res.EventsReplayed != 2 {
+			t.Errorf("expected EventsReplayed 2, got %d", res.EventsReplayed)
+		}
+		if res.State.Name != "Alice" || res.State.Email != "alice@example.com" {
+			t.Errorf("unexpected state: %+v", res.State)
+		}
+		if res.Data().Name != "Alice" {
+			t.Errorf("expected res.Data() to equal res.State")
+		}
+	})
+
+	t.Run("snapshot hit at head with zero events replayed", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		snapPayload, err := json.Marshal(&userState{ID: "user-1", Name: "Alice"})
+		if err != nil {
+			t.Fatalf("marshal failed: %v", err)
+		}
+		snapStore := &mockSnapshotStore{
+			getFunc: func(_ context.Context, _ pgx.Tx, _, _ string) (snapshot.Snapshot, error) {
+				return snapshot.Snapshot{
+					StreamType:    "User",
+					StreamID:      "user-1",
+					StreamVersion: 5,
+					SchemaVersion: 1,
+					Payload:       snapPayload,
+				}, nil
+			},
+		}
+		reader := &mockStreamReader{
+			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _, _ *int64) (store.Stream, error) {
+				return store.Stream{StreamType: streamType, StreamID: streamID}, nil
+			},
+		}
+
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository failed: %v", err)
+		}
+		res, err := repo.Load(ctx, nil, "user-1")
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		if !res.SnapshotHit {
+			t.Errorf("expected SnapshotHit to be true")
+		}
+		if res.SnapshotVersion != 5 {
+			t.Errorf("expected SnapshotVersion 5, got %d", res.SnapshotVersion)
+		}
+		if res.StreamVersion != 5 {
+			t.Errorf("expected StreamVersion 5, got %d", res.StreamVersion)
+		}
+		if res.EventsReplayed != 0 {
+			t.Errorf("expected EventsReplayed 0, got %d", res.EventsReplayed)
+		}
+	})
+
+	t.Run("snapshot miss (empty stream)", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		snapStore := &mockSnapshotStore{}
+		reader := &mockStreamReader{}
+
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository failed: %v", err)
+		}
+		res, err := repo.Load(ctx, nil, "user-1")
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		if res.SnapshotHit {
+			t.Errorf("expected SnapshotHit to be false")
+		}
+		if res.SnapshotVersion != 0 {
+			t.Errorf("expected SnapshotVersion 0, got %d", res.SnapshotVersion)
+		}
+		if res.StreamVersion != 0 {
+			t.Errorf("expected StreamVersion 0, got %d", res.StreamVersion)
+		}
+		if res.EventsReplayed != 0 {
+			t.Errorf("expected EventsReplayed 0, got %d", res.EventsReplayed)
+		}
+	})
+}
+
+func TestSnapshotPolicy(t *testing.T) {
+	t.Run("EveryNEvents", func(t *testing.T) {
+		policy := snapshot.EveryNEvents(100)
+
+		// 1. Not enough events: snapshot at v100, current at v150, 20 new events (total delta 50+20=70 < 100)
+		res := snapshot.Result[*userState]{
+			StreamVersion:   150,
+			SnapshotVersion: 100,
+			SnapshotHit:     true,
+		}
+		if res.ShouldSnapshot(policy, 20) {
+			t.Errorf("expected EveryNEvents(100) to return false for 70 events delta")
+		}
+
+		// 2. Exactly reaches threshold: delta 50 + 50 appended = 100
+		if !res.ShouldSnapshot(policy, 50) {
+			t.Errorf("expected EveryNEvents(100) to return true for 100 events delta")
+		}
+
+		// 3. Multi-event batch jumps over threshold: delta 50 + 65 appended = 115 >= 100
+		if !res.ShouldSnapshot(policy, 65) {
+			t.Errorf("expected EveryNEvents(100) to return true for 115 events delta (batch jump)")
+		}
+
+		// 4. Direct policy call
+		if !policy(150, 100, 65) {
+			t.Errorf("expected direct policy call to return true")
+		}
+
+		// 5. No snapshot loaded: snapshotVersion=0, streamVersion=80, 25 appended = 105 >= 100
+		noSnapRes := snapshot.Result[*userState]{
+			StreamVersion:   80,
+			SnapshotVersion: 0,
+			SnapshotHit:     false,
+		}
+		if !noSnapRes.ShouldSnapshot(policy, 25) {
+			t.Errorf("expected EveryNEvents(100) to return true for 105 events since inception")
+		}
+
+		// 6. Invalid n (<= 0) returns false
+		zeroPolicy := snapshot.EveryNEvents(0)
+		if res.ShouldSnapshot(zeroPolicy, 1000) {
+			t.Errorf("expected EveryNEvents(0) to return false")
+		}
+
+		// 7. Nil policy returns false
+		if res.ShouldSnapshot(nil, 1000) {
+			t.Errorf("expected nil policy to return false")
+		}
+	})
+
+	t.Run("Never", func(t *testing.T) {
+		policy := snapshot.Never()
+		res := snapshot.Result[*userState]{
+			StreamVersion:   1000,
+			SnapshotVersion: 0,
+		}
+		if res.ShouldSnapshot(policy, 1000) {
+			t.Errorf("expected Never() to return false")
 		}
 	})
 }

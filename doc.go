@@ -16,8 +16,8 @@
 //
 // Example usage:
 //
-//	repo, err := snapshot.NewRepository[*User](eventStore, snapshotStore, config)
-//	user, version, err := repo.Load(ctx, tx, userID)
-//	// ... run domain logic ...
+//	res, err := repo.Load(ctx, tx, userID)
+//	user := res.State
+//	// ... run domain logic and append events ...
 //	err = repo.Save(ctx, tx, userID, newVersion, user)
 package snapshot

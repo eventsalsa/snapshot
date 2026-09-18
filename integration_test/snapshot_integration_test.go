@@ -343,16 +343,16 @@ func TestRepositoryRehydration(t *testing.T) {
 
 	// --- Case A: Load with zero history ---
 	tx, _ := db.Begin(ctx)
-	u, version, err := repo.Load(ctx, tx, id)
+	res, err := repo.Load(ctx, tx, id)
 	_ = tx.Rollback(ctx)
 	if err != nil {
 		t.Fatalf("Load A failed: %v", err)
 	}
-	if version != 0 {
-		t.Errorf("expected version 0, got %d", version)
+	if res.StreamVersion != 0 {
+		t.Errorf("expected version 0, got %d", res.StreamVersion)
 	}
-	if u.ID != id {
-		t.Errorf("expected ID %s, got %s", id, u.ID)
+	if res.State.ID != id {
+		t.Errorf("expected ID %s, got %s", id, res.State.ID)
 	}
 	if applyCallCount != 0 {
 		t.Errorf("expected 0 apply calls, got %d", applyCallCount)
@@ -366,16 +366,16 @@ func TestRepositoryRehydration(t *testing.T) {
 
 	tx, _ = db.Begin(ctx)
 	applyCallCount = 0
-	u, version, err = repo.Load(ctx, tx, id)
+	res, err = repo.Load(ctx, tx, id)
 	_ = tx.Rollback(ctx)
 	if err != nil {
 		t.Fatalf("Load B failed: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("expected version 2, got %d", version)
+	if res.StreamVersion != 2 {
+		t.Errorf("expected version 2, got %d", res.StreamVersion)
 	}
-	if u.Name != "Bob S." || u.Email != "bob@example.com" {
-		t.Errorf("incorrect state rehydrated: %+v", u)
+	if res.State.Name != "Bob S." || res.State.Email != "bob@example.com" {
+		t.Errorf("incorrect state rehydrated: %+v", res.State)
 	}
 	if applyCallCount != 2 {
 		t.Errorf("expected 2 apply calls, got %d", applyCallCount)
@@ -383,7 +383,7 @@ func TestRepositoryRehydration(t *testing.T) {
 
 	// --- Case C: Save snapshot and load ---
 	tx, _ = db.Begin(ctx)
-	err = repo.Save(ctx, tx, id, version, u)
+	err = repo.Save(ctx, tx, id, res.StreamVersion, res.State)
 	if err != nil {
 		t.Fatalf("Save snapshot failed: %v", err)
 	}
@@ -398,16 +398,16 @@ func TestRepositoryRehydration(t *testing.T) {
 	// Load now: should read snapshot (v2) and only apply v3 and v4 (2 apply calls)
 	tx, _ = db.Begin(ctx)
 	applyCallCount = 0
-	u, version, err = repo.Load(ctx, tx, id)
+	res, err = repo.Load(ctx, tx, id)
 	_ = tx.Rollback(ctx)
 	if err != nil {
 		t.Fatalf("Load C failed: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("expected version 4, got %d", version)
+	if res.StreamVersion != 4 {
+		t.Errorf("expected version 4, got %d", res.StreamVersion)
 	}
-	if u.Name != "Bobby" || u.Email != "bobby@example.com" {
-		t.Errorf("incorrect state rehydrated: %+v", u)
+	if res.State.Name != "Bobby" || res.State.Email != "bobby@example.com" {
+		t.Errorf("incorrect state rehydrated: %+v", res.State)
 	}
 	if applyCallCount != 2 {
 		t.Errorf("expected 2 apply calls (delta only), got %d", applyCallCount)
@@ -425,13 +425,13 @@ func TestRepositoryRehydration(t *testing.T) {
 	// It should replay all 4 events from version 1 (4 apply calls)
 	tx, _ = db.Begin(ctx)
 	applyCallCount = 0
-	u, version, err = repoV2.Load(ctx, tx, id)
+	res, err = repoV2.Load(ctx, tx, id)
 	_ = tx.Rollback(ctx)
 	if err != nil {
 		t.Fatalf("Load D failed: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("expected version 4, got %d", version)
+	if res.StreamVersion != 4 {
+		t.Errorf("expected version 4, got %d", res.StreamVersion)
 	}
 	if applyCallCount != 4 {
 		t.Errorf("expected 4 apply calls (full replay due to schema mismatch), got %d", applyCallCount)
@@ -531,15 +531,15 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 	}
 
 	// In default resilient mode, Load discards corrupt snapshot and falls back to full replay
-	user, version, err := repo.Load(ctx, tx, id)
+	res, err := repo.Load(ctx, tx, id)
 	if err != nil {
 		t.Errorf("expected resilient load fallback, got error: %v", err)
 	}
-	if version != 0 {
-		t.Errorf("expected version 0 (empty stream), got %d", version)
+	if res.StreamVersion != 0 {
+		t.Errorf("expected version 0 (empty stream), got %d", res.StreamVersion)
 	}
-	if user.ID != id {
-		t.Errorf("expected user ID %q, got %q", id, user.ID)
+	if res.State.ID != id {
+		t.Errorf("expected user ID %q, got %q", id, res.State.ID)
 	}
 
 	// In strict mode (FailOnCorruptSnapshot: true), Load returns the unmarshal error
@@ -549,7 +549,7 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create strict repository: %v", err)
 	}
-	_, _, err = strictRepo.Load(ctx, tx, id)
+	_, err = strictRepo.Load(ctx, tx, id)
 	if err == nil {
 		t.Error("expected load error in strict mode due to corrupt JSON unmarshal")
 	}

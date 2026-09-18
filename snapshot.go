@@ -19,6 +19,64 @@ type Snapshot struct {
 	SchemaVersion int
 }
 
+// Result contains the rehydrated stream state along with operational load data.
+type Result[T any] struct {
+	// State is the rehydrated stream state up to StreamVersion.
+	State T
+
+	// StreamVersion is the final version of the stream after delta replay.
+	StreamVersion int64
+
+	// SnapshotVersion is the version of the snapshot that was loaded (0 if no snapshot was used).
+	SnapshotVersion int64
+
+	// EventsReplayed is the number of delta events replayed from the event store.
+	EventsReplayed int
+
+	// SchemaVersion is the schema version of the snapshot that was loaded (0 if none was used).
+	SchemaVersion int
+
+	// SnapshotHit is true if a valid snapshot matching the configured schema version was loaded and used.
+	SnapshotHit bool
+}
+
+// Data returns the rehydrated stream state (alias for State).
+func (r Result[T]) Data() T {
+	return r.State
+}
+
+// LoadResult is an alias for Result for callers who prefer explicit naming.
+type LoadResult[T any] = Result[T]
+
+// Policy evaluates whether a snapshot should be persisted following an append operation.
+// It receives the stream version at load time, the snapshot version at load time (0 if miss),
+// and the number of events appended to the stream.
+type Policy func(streamVersion, snapshotVersion int64, appendedCount int64) bool
+
+// EveryNEvents returns a policy that triggers a snapshot whenever the number of events
+// since the last snapshot (including newly appended events) is greater than or equal to n.
+func EveryNEvents(n int64) Policy {
+	return func(streamVersion, snapshotVersion int64, appendedCount int64) bool {
+		if n <= 0 {
+			return false
+		}
+		return (streamVersion-snapshotVersion)+appendedCount >= n
+	}
+}
+
+// Never returns a policy that never triggers a snapshot.
+func Never() Policy {
+	return func(_, _, _ int64) bool { return false }
+}
+
+// ShouldSnapshot evaluates whether the given policy triggers a snapshot after appending appendedCount events.
+func (r Result[T]) ShouldSnapshot(policy Policy, appendedCount int64) bool {
+	if policy == nil {
+		return false
+	}
+	return policy(r.StreamVersion, r.SnapshotVersion, appendedCount)
+}
+
 // Store defines the low-level persistence interface for snapshots.
 type Store interface {
 	// Get retrieves the latest snapshot for the given stream.
@@ -115,22 +173,23 @@ func NewRepository[T any](
 // matching the configured SchemaVersion, it deserializes the state and reads
 // newer events starting from version S + 1. Otherwise, it initializes a new state
 // and reads all events from the beginning.
-func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (state T, version int64, err error) {
+func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Result[T], err error) {
 	var snap Snapshot
 	snap, err = r.snapshotStore.Get(ctx, tx, r.config.StreamType, id)
 	if err != nil {
-		return state, 0, fmt.Errorf("failed to load snapshot: %w", err)
+		return res, fmt.Errorf("failed to load snapshot: %w", err)
 	}
 
 	var fromVersion *int64
 	var initialized bool
+	var version int64
 
 	// Check if we have a valid snapshot matching the current schema version
 	if snap.StreamVersion > 0 && snap.SchemaVersion == r.config.SchemaVersion {
-		state, err = r.config.Unmarshal(snap.Payload)
+		res.State, err = r.config.Unmarshal(snap.Payload)
 		if err != nil {
 			if r.config.FailOnCorruptSnapshot {
-				return state, 0, fmt.Errorf("failed to unmarshal snapshot: %w", err)
+				return res, fmt.Errorf("failed to unmarshal snapshot: %w", err)
 			}
 			if r.config.Logger != nil {
 				r.config.Logger.Error(ctx, "failed to unmarshal snapshot payload; falling back to full stream replay",
@@ -145,11 +204,14 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (state T
 			nextVersion := snap.StreamVersion + 1
 			fromVersion = &nextVersion
 			initialized = true
+			res.SnapshotHit = true
+			res.SnapshotVersion = snap.StreamVersion
+			res.SchemaVersion = snap.SchemaVersion
 		}
 	}
 
 	if !initialized {
-		state = r.config.Initializer(id)
+		res.State = r.config.Initializer(id)
 		version = 0
 		fromVersion = nil
 	}
@@ -157,18 +219,21 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (state T
 	// Read newer events
 	stream, err := r.reader.ReadStream(ctx, tx, r.config.StreamType, id, fromVersion, nil)
 	if err != nil {
-		return state, 0, fmt.Errorf("failed to read stream: %w", err)
+		return res, fmt.Errorf("failed to read stream: %w", err)
 	}
 
 	for i := range stream.Events {
-		state, err = r.config.Apply(state, stream.Events[i])
+		res.State, err = r.config.Apply(res.State, stream.Events[i])
 		if err != nil {
-			return state, 0, fmt.Errorf("failed to apply event v%d: %w", stream.Events[i].StreamVersion, err)
+			return res, fmt.Errorf("failed to apply event v%d: %w", stream.Events[i].StreamVersion, err)
 		}
 		version = stream.Events[i].StreamVersion
 	}
 
-	return state, version, nil
+	res.StreamVersion = version
+	res.EventsReplayed = len(stream.Events)
+
+	return res, nil
 }
 
 // Save persists a snapshot of the current stream state at the specified version.
