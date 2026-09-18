@@ -32,6 +32,10 @@ type Store interface {
 
 // RepositoryConfig contains configuration for the generic Repository.
 type RepositoryConfig[T any] struct {
+	// Logger is an optional logger for observability.
+	// If nil, logging is disabled (zero overhead).
+	Logger store.Logger
+
 	// Initializer instantiates a new, empty stream state for a given ID.
 	Initializer func(id string) T
 
@@ -53,6 +57,12 @@ type RepositoryConfig[T any] struct {
 	// If a stored snapshot has a different SchemaVersion, it is ignored
 	// and the stream is rehydrated from version 1 of the event log.
 	SchemaVersion int
+
+	// FailOnCorruptSnapshot determines whether an unmarshaling error on a snapshot
+	// payload immediately fails Load (true), or safely discards the snapshot and
+	// falls back to replaying the full stream of events from version 1 (false).
+	// Defaults to false (resilient fallback).
+	FailOnCorruptSnapshot bool
 }
 
 // Repository orchestrates the loading and saving of stream states
@@ -119,13 +129,23 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (state T
 	if snap.StreamVersion > 0 && snap.SchemaVersion == r.config.SchemaVersion {
 		state, err = r.config.Unmarshal(snap.Payload)
 		if err != nil {
-			// If unmarshaling fails, return the error to avoid corrupt or incomplete states.
-			return state, 0, fmt.Errorf("failed to unmarshal snapshot: %w", err)
+			if r.config.FailOnCorruptSnapshot {
+				return state, 0, fmt.Errorf("failed to unmarshal snapshot: %w", err)
+			}
+			if r.config.Logger != nil {
+				r.config.Logger.Error(ctx, "failed to unmarshal snapshot payload; falling back to full stream replay",
+					"stream_type", r.config.StreamType,
+					"stream_id", id,
+					"stream_version", snap.StreamVersion,
+					"schema_version", snap.SchemaVersion,
+					"error", err)
+			}
+		} else {
+			version = snap.StreamVersion
+			nextVersion := snap.StreamVersion + 1
+			fromVersion = &nextVersion
+			initialized = true
 		}
-		version = snap.StreamVersion
-		nextVersion := snap.StreamVersion + 1
-		fromVersion = &nextVersion
-		initialized = true
 	}
 
 	if !initialized {
