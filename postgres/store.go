@@ -142,9 +142,10 @@ func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) err
 			schema_version = EXCLUDED.schema_version,
 			payload = EXCLUDED.payload,
 			created_at = NOW()
-	`, s.config.SnapshotsTable)
+		WHERE EXCLUDED.stream_version >= %s.stream_version
+	`, s.config.SnapshotsTable, s.config.SnapshotsTable)
 
-	_, err := tx.Exec(ctx, query,
+	tag, err := tx.Exec(ctx, query,
 		snap.StreamType,
 		snap.StreamID,
 		snap.StreamVersion,
@@ -156,10 +157,17 @@ func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) err
 	}
 
 	if s.config.Logger != nil {
-		s.config.Logger.Debug(ctx, "snapshot saved successfully",
-			"stream_type", snap.StreamType,
-			"stream_id", snap.StreamID,
-			"stream_version", snap.StreamVersion)
+		if tag.RowsAffected() == 0 {
+			s.config.Logger.Debug(ctx, "snapshot update skipped due to version regression",
+				"stream_type", snap.StreamType,
+				"stream_id", snap.StreamID,
+				"stream_version", snap.StreamVersion)
+		} else {
+			s.config.Logger.Debug(ctx, "snapshot saved successfully",
+				"stream_type", snap.StreamType,
+				"stream_id", snap.StreamID,
+				"stream_version", snap.StreamVersion)
+		}
 	}
 
 	return nil
