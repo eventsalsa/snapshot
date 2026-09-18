@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS %s (
     payload BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
-    PRIMARY KEY (stream_type, stream_id)
+    PRIMARY KEY (stream_type, stream_id, schema_version)
 );
 
 -- Index for schema version analysis/observability

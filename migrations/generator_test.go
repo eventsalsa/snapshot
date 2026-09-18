@@ -49,7 +49,7 @@ func TestGeneratePostgres_Default(t *testing.T) {
 		"stream_version BIGINT NOT NULL,",
 		"schema_version INT NOT NULL,",
 		"payload BYTEA NOT NULL,",
-		"PRIMARY KEY (stream_type, stream_id)",
+		"PRIMARY KEY (stream_type, stream_id, schema_version)",
 		"CREATE INDEX IF NOT EXISTS idx_snapshots_schema_version",
 		"ON snapshots (schema_version);",
 	}

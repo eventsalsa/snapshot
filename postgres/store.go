@@ -70,27 +70,46 @@ func NewStore(config *StoreConfig) *Store {
 }
 
 // Get implements snapshot.Store.
-// It retrieves the latest snapshot for the given stream.
+// It retrieves the snapshot for the given stream with the highest schema version <= maxSchemaVersion.
+// If maxSchemaVersion <= 0, it retrieves the latest snapshot without schema version filtering.
 // Returns a zero Snapshot and nil if no snapshot exists.
-func (s *Store) Get(ctx context.Context, tx pgx.Tx, streamType, streamID string) (snapshot.Snapshot, error) {
+func (s *Store) Get(ctx context.Context, tx pgx.Tx, streamType, streamID string, maxSchemaVersion int) (snapshot.Snapshot, error) {
 	if s.config.Logger != nil {
 		s.config.Logger.Debug(ctx, "fetching snapshot",
 			"stream_type", streamType,
-			"stream_id", streamID)
+			"stream_id", streamID,
+			"max_schema_version", maxSchemaVersion)
 	}
 
-	//nolint:gosec // G201: table name from trusted config, not user input
-	query := fmt.Sprintf(`
-		SELECT stream_version, schema_version, payload, created_at 
-		FROM %s 
-		WHERE stream_type = $1 AND stream_id = $2
-	`, s.config.SnapshotsTable)
+	var query string
+	var args []any
+	if maxSchemaVersion > 0 {
+		//nolint:gosec // G201: table name from trusted config, not user input
+		query = fmt.Sprintf(`
+			SELECT stream_version, schema_version, payload, created_at 
+			FROM %s 
+			WHERE stream_type = $1 AND stream_id = $2 AND schema_version <= $3
+			ORDER BY schema_version DESC
+			LIMIT 1
+		`, s.config.SnapshotsTable)
+		args = []any{streamType, streamID, maxSchemaVersion}
+	} else {
+		//nolint:gosec // G201: table name from trusted config, not user input
+		query = fmt.Sprintf(`
+			SELECT stream_version, schema_version, payload, created_at 
+			FROM %s 
+			WHERE stream_type = $1 AND stream_id = $2
+			ORDER BY schema_version DESC
+			LIMIT 1
+		`, s.config.SnapshotsTable)
+		args = []any{streamType, streamID}
+	}
 
 	var snap snapshot.Snapshot
 	snap.StreamType = streamType
 	snap.StreamID = streamID
 
-	err := tx.QueryRow(ctx, query, streamType, streamID).Scan(
+	err := tx.QueryRow(ctx, query, args...).Scan(
 		&snap.StreamVersion,
 		&snap.SchemaVersion,
 		&snap.Payload,
@@ -121,8 +140,8 @@ func (s *Store) Get(ctx context.Context, tx pgx.Tx, streamType, streamID string)
 }
 
 // Put implements snapshot.Store.
-// It saves (inserts or updates) a snapshot for the stream.
-// Overwrites the existing snapshot if it already exists for the (type, id) pair.
+// It saves (inserts or updates) a snapshot for the stream and schema version.
+// Preserves monotonicity for the (stream_type, stream_id, schema_version) tuple.
 func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) error {
 	if s.config.Logger != nil {
 		s.config.Logger.Debug(ctx, "saving snapshot",
@@ -134,12 +153,11 @@ func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) err
 
 	//nolint:gosec // G201: table name from trusted config, not user input
 	query := fmt.Sprintf(`
-		INSERT INTO %s (stream_type, stream_id, stream_version, schema_version, payload, created_at)
+		INSERT INTO %s (stream_type, stream_id, schema_version, stream_version, payload, created_at)
 		VALUES ($1, $2, $3, $4, $5, NOW())
-		ON CONFLICT (stream_type, stream_id)
+		ON CONFLICT (stream_type, stream_id, schema_version)
 		DO UPDATE SET 
 			stream_version = EXCLUDED.stream_version,
-			schema_version = EXCLUDED.schema_version,
 			payload = EXCLUDED.payload,
 			created_at = NOW()
 		WHERE EXCLUDED.stream_version >= %s.stream_version
@@ -148,8 +166,8 @@ func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) err
 	tag, err := tx.Exec(ctx, query,
 		snap.StreamType,
 		snap.StreamID,
-		snap.StreamVersion,
 		snap.SchemaVersion,
+		snap.StreamVersion,
 		snap.Payload,
 	)
 	if err != nil {
@@ -161,12 +179,14 @@ func (s *Store) Put(ctx context.Context, tx pgx.Tx, snap *snapshot.Snapshot) err
 			s.config.Logger.Debug(ctx, "snapshot update skipped due to version regression",
 				"stream_type", snap.StreamType,
 				"stream_id", snap.StreamID,
-				"stream_version", snap.StreamVersion)
+				"stream_version", snap.StreamVersion,
+				"schema_version", snap.SchemaVersion)
 		} else {
 			s.config.Logger.Debug(ctx, "snapshot saved successfully",
 				"stream_type", snap.StreamType,
 				"stream_id", snap.StreamID,
-				"stream_version", snap.StreamVersion)
+				"stream_version", snap.StreamVersion,
+				"schema_version", snap.SchemaVersion)
 		}
 	}
 

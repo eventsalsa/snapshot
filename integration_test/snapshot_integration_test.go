@@ -99,11 +99,11 @@ func setupPostgres(t *testing.T) *pgxpool.Pool {
 	CREATE TABLE IF NOT EXISTS snapshots (
 		stream_type TEXT NOT NULL,
 		stream_id TEXT NOT NULL,
-		stream_version BIGINT NOT NULL,
 		schema_version INT NOT NULL,
+		stream_version BIGINT NOT NULL,
 		payload BYTEA NOT NULL,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (stream_type, stream_id)
+		PRIMARY KEY (stream_type, stream_id, schema_version)
 	);
 	`
 
@@ -157,7 +157,7 @@ func TestRawStoreGetPut(t *testing.T) {
 	id := uuid.New().String()
 
 	// 1. Get non-existent snapshot
-	snap, err := store.Get(ctx, tx, "User", id)
+	snap, err := store.Get(ctx, tx, "User", id, 1)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestRawStoreGetPut(t *testing.T) {
 	}
 
 	// 3. Get snapshot and verify
-	snap, err = store.Get(ctx, tx, "User", id)
+	snap, err = store.Get(ctx, tx, "User", id, 1)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestRawStoreGetPut(t *testing.T) {
 	}
 
 	// 5. Get snapshot and verify update
-	snap, err = store.Get(ctx, tx, "User", id)
+	snap, err = store.Get(ctx, tx, "User", id, 1)
 	if err != nil {
 		t.Fatalf("Get updated failed: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestRawStoreMonotonicVersionGuard(t *testing.T) {
 	}
 
 	// Verify it was stored at v30
-	snap, err := store.Get(ctx, tx, "User", id)
+	snap, err := store.Get(ctx, tx, "User", id, 1)
 	if err != nil {
 		t.Fatalf("Get v30 failed: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestRawStoreMonotonicVersionGuard(t *testing.T) {
 	}
 
 	// Verify the row did NOT regress to v10
-	snap, err = store.Get(ctx, tx, "User", id)
+	snap, err = store.Get(ctx, tx, "User", id, 1)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -285,12 +285,129 @@ func TestRawStoreMonotonicVersionGuard(t *testing.T) {
 		t.Fatalf("Put v31 failed: %v", err)
 	}
 
-	snap, err = store.Get(ctx, tx, "User", id)
+	snap, err = store.Get(ctx, tx, "User", id, 1)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
 	if snap.StreamVersion != 31 {
 		t.Errorf("expected version 31, got %d", snap.StreamVersion)
+	}
+}
+
+func TestRawStoreMultiVersionCoexistence(t *testing.T) {
+	db := setupPostgres(t)
+	ctx := context.Background()
+	store := snapshotpostgres.NewStore(snapshotpostgres.DefaultStoreConfig())
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	id := uuid.New().String()
+
+	// 1. Put schema_version 1 at stream_version 10
+	snapV1 := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 10,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"name":"Alice","schema":1}`),
+	}
+	if err := store.Put(ctx, tx, &snapV1); err != nil {
+		t.Fatalf("Put schema 1 failed: %v", err)
+	}
+
+	// 2. Put schema_version 2 at stream_version 12 (different schema version for same stream)
+	snapV2 := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 12,
+		SchemaVersion: 2,
+		Payload:       []byte(`{"full_name":"Alice Wonderland","schema":2}`),
+	}
+	if err := store.Put(ctx, tx, &snapV2); err != nil {
+		t.Fatalf("Put schema 2 failed: %v", err)
+	}
+
+	// 3. Verify both rows coexist in PostgreSQL
+	gotV1, err := store.Get(ctx, tx, "User", id, 1)
+	if err != nil {
+		t.Fatalf("Get schema 1 failed: %v", err)
+	}
+	if gotV1.SchemaVersion != 1 || gotV1.StreamVersion != 10 {
+		t.Errorf("expected schema 1 at stream version 10, got schema %d at version %d", gotV1.SchemaVersion, gotV1.StreamVersion)
+	}
+	if string(gotV1.Payload) != string(snapV1.Payload) {
+		t.Errorf("schema 1 payload mismatch: got %s", gotV1.Payload)
+	}
+
+	gotV2, err := store.Get(ctx, tx, "User", id, 2)
+	if err != nil {
+		t.Fatalf("Get schema 2 failed: %v", err)
+	}
+	if gotV2.SchemaVersion != 2 || gotV2.StreamVersion != 12 {
+		t.Errorf("expected schema 2 at stream version 12, got schema %d at version %d", gotV2.SchemaVersion, gotV2.StreamVersion)
+	}
+
+	// Query with maxSchemaVersion <= 0 returns the highest schema version (2)
+	gotLatest, err := store.Get(ctx, tx, "User", id, 0)
+	if err != nil {
+		t.Fatalf("Get latest failed: %v", err)
+	}
+	if gotLatest.SchemaVersion != 2 || gotLatest.StreamVersion != 12 {
+		t.Errorf("expected latest schema 2 at stream version 12, got schema %d at version %d", gotLatest.SchemaVersion, gotLatest.StreamVersion)
+	}
+
+	// 4. Advance schema 1 to stream_version 15 without altering schema 2
+	snapV1Adv := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 15,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"name":"Alice Updated","schema":1}`),
+	}
+	if err := store.Put(ctx, tx, &snapV1Adv); err != nil {
+		t.Fatalf("Put advanced schema 1 failed: %v", err)
+	}
+
+	gotV1Adv, err := store.Get(ctx, tx, "User", id, 1)
+	if err != nil {
+		t.Fatalf("Get advanced schema 1 failed: %v", err)
+	}
+	if gotV1Adv.StreamVersion != 15 {
+		t.Errorf("expected schema 1 at stream version 15, got %d", gotV1Adv.StreamVersion)
+	}
+
+	// Verify schema 2 is completely unchanged
+	gotV2Check, err := store.Get(ctx, tx, "User", id, 2)
+	if err != nil {
+		t.Fatalf("Get schema 2 check failed: %v", err)
+	}
+	if gotV2Check.StreamVersion != 12 {
+		t.Errorf("schema 2 was modified unexpectedly! expected stream version 12, got %d", gotV2Check.StreamVersion)
+	}
+
+	// 5. Monotonic check is scoped per (stream_type, stream_id, schema_version)
+	// A lower stream_version 14 for schema 1 should not overwrite stream_version 15
+	snapV1Old := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      id,
+		StreamVersion: 14,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"name":"Alice Stale","schema":1}`),
+	}
+	if err := store.Put(ctx, tx, &snapV1Old); err != nil {
+		t.Fatalf("Put stale schema 1 failed: %v", err)
+	}
+
+	gotV1AfterStale, err := store.Get(ctx, tx, "User", id, 1)
+	if err != nil {
+		t.Fatalf("Get schema 1 after stale failed: %v", err)
+	}
+	if gotV1AfterStale.StreamVersion != 15 {
+		t.Errorf("expected monotonic protection: stream version remained 15, got %d", gotV1AfterStale.StreamVersion)
 	}
 }
 
@@ -633,5 +750,222 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 	}
 	if resOrphan.State.Name != "" {
 		t.Errorf("expected empty name for initial state, got %q", resOrphan.State.Name)
+	}
+}
+
+type TestUserV2 struct {
+	ID       string `json:"id"`
+	FullName string `json:"full_name"`
+	Email    string `json:"email"`
+}
+
+func TestRepositoryMultiVersionRollingDeploymentAndUpcasting(t *testing.T) {
+	db := setupPostgres(t)
+	ctx := context.Background()
+
+	es := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
+	ss := snapshotpostgres.NewStore(snapshotpostgres.DefaultStoreConfig())
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	id := uuid.New().String()
+
+	// V1 configuration
+	cfgV1 := snapshot.RepositoryConfig[*TestUser]{
+		StreamType:    "User",
+		SchemaVersion: 1,
+		Initializer: func(id string) *TestUser {
+			return &TestUser{ID: id}
+		},
+		Apply: func(state *TestUser, event store.PersistedEvent) (*TestUser, error) {
+			var ev TestEvent
+			if err := json.Unmarshal(event.Payload, &ev); err != nil {
+				return nil, err
+			}
+			if ev.Name != "" {
+				state.Name = ev.Name
+			}
+			if ev.Email != "" {
+				state.Email = ev.Email
+			}
+			return state, nil
+		},
+		Marshal: func(state *TestUser) ([]byte, error) {
+			return json.Marshal(state)
+		},
+		Unmarshal: func(data []byte) (*TestUser, error) {
+			var state TestUser
+			if err := json.Unmarshal(data, &state); err != nil {
+				return nil, err
+			}
+			return &state, nil
+		},
+	}
+
+	// V2 configuration with Upcaster from Schema 1 -> Schema 2
+	cfgV2 := snapshot.RepositoryConfig[*TestUserV2]{
+		StreamType:    "User",
+		SchemaVersion: 2,
+		Initializer: func(id string) *TestUserV2 {
+			return &TestUserV2{ID: id}
+		},
+		Apply: func(state *TestUserV2, event store.PersistedEvent) (*TestUserV2, error) {
+			var ev TestEvent
+			if err := json.Unmarshal(event.Payload, &ev); err != nil {
+				return nil, err
+			}
+			if ev.Name != "" {
+				state.FullName = ev.Name
+			}
+			if ev.Email != "" {
+				state.Email = ev.Email
+			}
+			return state, nil
+		},
+		Marshal: func(state *TestUserV2) ([]byte, error) {
+			return json.Marshal(state)
+		},
+		Unmarshal: func(data []byte) (*TestUserV2, error) {
+			var state TestUserV2
+			if err := json.Unmarshal(data, &state); err != nil {
+				return nil, err
+			}
+			return &state, nil
+		},
+		Upcasters: map[int]snapshot.Upcaster{
+			1: func(fromVer int, payload []byte) ([]byte, error) {
+				var v1 TestUser
+				if err := json.Unmarshal(payload, &v1); err != nil {
+					return nil, err
+				}
+				v2 := TestUserV2{
+					ID:       v1.ID,
+					FullName: v1.Name + " (Upcasted)",
+					Email:    v1.Email,
+				}
+				return json.Marshal(v2)
+			},
+		},
+	}
+
+	repoV1, err := snapshot.NewRepository(es, ss, cfgV1)
+	if err != nil {
+		t.Fatalf("NewRepository v1: %v", err)
+	}
+	repoV2, err := snapshot.NewRepository(es, ss, cfgV2)
+	if err != nil {
+		t.Fatalf("NewRepository v2: %v", err)
+	}
+
+	// 1. Create stream with 3 events
+	appendTestEvent(t, ctx, tx, es, id, "UserCreated", "Bob", "bob@example.com", store.NoStream())
+	appendTestEvent(t, ctx, tx, es, id, "UserUpdated", "Bob Smith", "", store.Exact(1))
+	appendTestEvent(t, ctx, tx, es, id, "UserUpdated", "Bob Smith Jr.", "", store.Exact(2))
+
+	// 2. V1 pod loads stream and saves a v1 snapshot at stream_version 3
+	loadV1, err := repoV1.Load(ctx, tx, id)
+	if err != nil {
+		t.Fatalf("V1 Load failed: %v", err)
+	}
+	if loadV1.StreamVersion != 3 || loadV1.State.Name != "Bob Smith Jr." {
+		t.Fatalf("unexpected V1 state: version=%d, name=%s", loadV1.StreamVersion, loadV1.State.Name)
+	}
+	if err := repoV1.Save(ctx, tx, id, loadV1.StreamVersion, loadV1.State); err != nil {
+		t.Fatalf("V1 Save failed: %v", err)
+	}
+
+	// 3. Append 2 delta events (v4 and v5)
+	appendTestEvent(t, ctx, tx, es, id, "UserUpdated", "", "bob.jr@example.com", store.Exact(3))
+	appendTestEvent(t, ctx, tx, es, id, "UserUpdated", "Robert Smith Jr.", "", store.Exact(4))
+
+	// 4. V2 pod loads stream: should load v1 snapshot, upcast it, and replay delta events 4 and 5
+	loadV2, err := repoV2.Load(ctx, tx, id)
+	if err != nil {
+		t.Fatalf("V2 Load failed: %v", err)
+	}
+	if !loadV2.SnapshotHit {
+		t.Error("expected V2 SnapshotHit = true")
+	}
+	if !loadV2.Upcasted {
+		t.Error("expected V2 Upcasted = true")
+	}
+	if loadV2.SnapshotSchemaVersion != 1 {
+		t.Errorf("expected SnapshotSchemaVersion = 1, got %d", loadV2.SnapshotSchemaVersion)
+	}
+	if loadV2.SchemaVersion != 2 {
+		t.Errorf("expected SchemaVersion = 2, got %d", loadV2.SchemaVersion)
+	}
+	if loadV2.SnapshotVersion != 3 {
+		t.Errorf("expected SnapshotVersion = 3, got %d", loadV2.SnapshotVersion)
+	}
+	if loadV2.StreamVersion != 5 {
+		t.Errorf("expected StreamVersion = 5, got %d", loadV2.StreamVersion)
+	}
+	if loadV2.EventsReplayed != 2 {
+		t.Errorf("expected EventsReplayed = 2, got %d", loadV2.EventsReplayed)
+	}
+	if loadV2.State.FullName != "Robert Smith Jr." {
+		t.Errorf("expected FullName 'Robert Smith Jr.', got %q", loadV2.State.FullName)
+	}
+	if loadV2.State.Email != "bob.jr@example.com" {
+		t.Errorf("expected Email 'bob.jr@example.com', got %q", loadV2.State.Email)
+	}
+
+	// 5. V2 pod saves snapshot at version 5 (schema_version 2)
+	if err := repoV2.Save(ctx, tx, id, loadV2.StreamVersion, loadV2.State); err != nil {
+		t.Fatalf("V2 Save failed: %v", err)
+	}
+
+	// 6. Verify Rolling Deployment Coexistence:
+	// A surviving V1 pod can still load the stream without seeing or crashing on V2 snapshots!
+	loadV1Survivor, err := repoV1.Load(ctx, tx, id)
+	if err != nil {
+		t.Fatalf("V1 survivor Load failed: %v", err)
+	}
+	if !loadV1Survivor.SnapshotHit {
+		t.Error("expected V1 survivor SnapshotHit = true")
+	}
+	if loadV1Survivor.Upcasted {
+		t.Error("expected V1 survivor Upcasted = false")
+	}
+	if loadV1Survivor.SnapshotSchemaVersion != 1 {
+		t.Errorf("expected V1 SnapshotSchemaVersion = 1, got %d", loadV1Survivor.SnapshotSchemaVersion)
+	}
+	if loadV1Survivor.SnapshotVersion != 3 {
+		t.Errorf("expected V1 SnapshotVersion = 3, got %d", loadV1Survivor.SnapshotVersion)
+	}
+	if loadV1Survivor.StreamVersion != 5 {
+		t.Errorf("expected V1 StreamVersion = 5, got %d", loadV1Survivor.StreamVersion)
+	}
+	if loadV1Survivor.EventsReplayed != 2 {
+		t.Errorf("expected V1 EventsReplayed = 2, got %d", loadV1Survivor.EventsReplayed)
+	}
+	if loadV1Survivor.State.Name != "Robert Smith Jr." {
+		t.Errorf("expected V1 state name 'Robert Smith Jr.', got %q", loadV1Survivor.State.Name)
+	}
+
+	// And a V2 pod loads with a direct hit on the V2 snapshot (no upcasting, 0 delta events)
+	loadV2Direct, err := repoV2.Load(ctx, tx, id)
+	if err != nil {
+		t.Fatalf("V2 direct Load failed: %v", err)
+	}
+	if !loadV2Direct.SnapshotHit {
+		t.Error("expected V2 direct SnapshotHit = true")
+	}
+	if loadV2Direct.Upcasted {
+		t.Error("expected V2 direct Upcasted = false")
+	}
+	if loadV2Direct.SnapshotSchemaVersion != 2 {
+		t.Errorf("expected V2 direct SnapshotSchemaVersion = 2, got %d", loadV2Direct.SnapshotSchemaVersion)
+	}
+	if loadV2Direct.SnapshotVersion != 5 {
+		t.Errorf("expected V2 direct SnapshotVersion = 5, got %d", loadV2Direct.SnapshotVersion)
+	}
+	if loadV2Direct.EventsReplayed != 0 {
+		t.Errorf("expected V2 direct EventsReplayed = 0, got %d", loadV2Direct.EventsReplayed)
 	}
 }

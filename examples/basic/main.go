@@ -326,7 +326,7 @@ func setupTables(ctx context.Context, db *pgxpool.Pool) {
 		schema_version INT NOT NULL,
 		payload BYTEA NOT NULL,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (stream_type, stream_id)
+		PRIMARY KEY (stream_type, stream_id, schema_version)
 	);
 	`
 
