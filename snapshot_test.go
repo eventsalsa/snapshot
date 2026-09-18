@@ -824,3 +824,127 @@ func TestSnapshotPolicy(t *testing.T) {
 		}
 	})
 }
+
+func TestRepository_SaveAppended(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("applies events and saves snapshot at new version", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		var savedSnap *snapshot.Snapshot
+		snapStore := &mockSnapshotStore{
+			putFunc: func(_ context.Context, _ pgx.Tx, snap *snapshot.Snapshot) error {
+				savedSnap = snap
+				return nil
+			},
+		}
+		repo, err := snapshot.NewRepository(&mockStreamReader{}, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		initialState := &userState{ID: "user-1", Name: "Alice"}
+		ev1, err := json.Marshal(userEvent{Name: "Alice Smith"})
+		if err != nil {
+			t.Fatalf("marshal failed: %v", err)
+		}
+		ev2, err := json.Marshal(userEvent{Email: "alice@example.com"})
+		if err != nil {
+			t.Fatalf("marshal failed: %v", err)
+		}
+
+		appendResult := store.AppendResult{
+			Events: []store.PersistedEvent{
+				{StreamType: "User", StreamID: "user-1", StreamVersion: 4, Payload: ev1},
+				{StreamType: "User", StreamID: "user-1", StreamVersion: 5, Payload: ev2},
+			},
+		}
+
+		updatedState, err := repo.SaveAppended(ctx, nil, "user-1", initialState, appendResult)
+		if err != nil {
+			t.Fatalf("SaveAppended failed: %v", err)
+		}
+
+		if updatedState.Name != "Alice Smith" || updatedState.Email != "alice@example.com" {
+			t.Errorf("state not properly folded: %+v", updatedState)
+		}
+		if savedSnap == nil {
+			t.Fatal("expected snapshot to be saved")
+		}
+		if savedSnap.StreamVersion != 5 {
+			t.Errorf("expected snapshot version 5, got %d", savedSnap.StreamVersion)
+		}
+	})
+
+	t.Run("empty append result is no-op", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		var savedSnap *snapshot.Snapshot
+		snapStore := &mockSnapshotStore{
+			putFunc: func(_ context.Context, _ pgx.Tx, snap *snapshot.Snapshot) error {
+				savedSnap = snap
+				return nil
+			},
+		}
+		repo, err := snapshot.NewRepository(&mockStreamReader{}, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		initialState := &userState{ID: "user-1", Name: "Alice"}
+		updatedState, err := repo.SaveAppended(ctx, nil, "user-1", initialState, store.AppendResult{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if updatedState != initialState {
+			t.Errorf("expected unchanged state")
+		}
+		if savedSnap != nil {
+			t.Error("expected no snapshot to be saved for empty append result")
+		}
+	})
+
+	t.Run("apply error propagates", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		cfg.Apply = func(_ *userState, _ store.PersistedEvent) (*userState, error) {
+			return nil, errors.New("apply error")
+		}
+		repo, err := snapshot.NewRepository(&mockStreamReader{}, &mockSnapshotStore{}, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		initialState := &userState{ID: "user-1"}
+		appendResult := store.AppendResult{
+			Events: []store.PersistedEvent{
+				{StreamType: "User", StreamID: "user-1", StreamVersion: 1, Payload: []byte("{}")},
+			},
+		}
+		_, err = repo.SaveAppended(ctx, nil, "user-1", initialState, appendResult)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("save error propagates", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		snapStore := &mockSnapshotStore{
+			putFunc: func(_ context.Context, _ pgx.Tx, _ *snapshot.Snapshot) error {
+				return errors.New("db write failure")
+			},
+		}
+		repo, err := snapshot.NewRepository(&mockStreamReader{}, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		initialState := &userState{ID: "user-1"}
+		appendResult := store.AppendResult{
+			Events: []store.PersistedEvent{
+				{StreamType: "User", StreamID: "user-1", StreamVersion: 1, Payload: []byte("{}")},
+			},
+		}
+		_, err = repo.SaveAppended(ctx, nil, "user-1", initialState, appendResult)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+}

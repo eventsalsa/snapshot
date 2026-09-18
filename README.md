@@ -5,14 +5,16 @@
 
 `github.com/eventsalsa/snapshot` is a generic, PostgreSQL-backed stream state snapshotting module for Go event-sourced applications. 
 
-It is designed to be used alongside [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store). By saving a snapshot of the stream state at a specific version, you avoid loading the full stream of events from version 1. Instead, the snapshot repository loads the latest snapshot, queries only subsequent events (the delta), and replays them to reconstruct the active state.
+It is designed to be used alongside [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store). By saving a snapshot of the stream state at a specific version, you avoid reading the full stream of events from version 1. The repository loads the latest snapshot, reads only subsequent events (the delta), and applies them to reconstruct the active state.
 
 ## Features
 
-- **Generic & Type-Safe**: Uses Go generics (`[T any]`) to define repositories, avoiding any coupling or structural inheritance inside your domain models.
-- **Pgx Transactional Integrity**: All operations run within the caller-provided `pgx.Tx` transaction, matching the design of `eventsalsa/store`.
-- **Automatic Schema Evolution**: Includes a `schema_version` column. If the snapshot stored in the database has a schema version that mismatches the code's expected version, the library automatically discards it and falls back to a full replay of events, ensuring structural safety.
-- **Low-Level and High-Level APIs**: Exposes a raw byte `Store` interface alongside a high-level orchestrated `Repository[T]`.
+- **Generic & Type-Safe**: Uses Go generics (`[T any]`) to define repositories, avoiding any coupling or structural inheritance inside your stream state types.
+- **Pgx Transactional Integrity**: All operations run within caller-provided `pgx.Tx` transactions, matching the design of `eventsalsa/store`.
+- **Automatic Schema Evolution**: Includes a `schema_version` column. If the snapshot stored in the database has a schema version that mismatches the code's expected version, the repository automatically discards it and falls back to a full replay of events from version 1.
+- **Resilient Fallback**: Discards corrupt or unparseable snapshot payloads and recovers automatically via event log replay.
+- **Append-Safe Persistence**: Provides `SaveAppended` to fold newly appended events into aggregate state before snapshot write, preventing state regression.
+- **Low-Level and High-Level APIs**: Exposes a raw byte `Store` interface alongside a high-level `Repository[T]`.
 - **Migration Generation**: Comes with a built-in SQL migration generator and CLI tool to generate PostgreSQL tables.
 
 ---
@@ -55,15 +57,15 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_schema_version
 
 Apply this migration using your preferred PostgreSQL migration runner.
 
-### 2. Define a Domain Model (Clean)
+### 2. Define Stream State
 
-Your stream state structs remain completely clean of library code:
+Define the state struct representing your materialized stream:
 
 ```go
-type User struct {
-	ID    string
-	Name  string
-	Email string
+type UserState struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
 }
 ```
 
@@ -75,45 +77,46 @@ Initialize the event store, snapshot store, and the generic snapshot repository:
 import (
 	"context"
 	"encoding/json"
-	
+
 	"github.com/eventsalsa/snapshot"
 	snapshotpostgres "github.com/eventsalsa/snapshot/postgres"
 	"github.com/eventsalsa/store"
 	storepostgres "github.com/eventsalsa/store/postgres"
 )
 
-// 1. Create the stores (normally singletons in your app)
+// 1. Create the stores (normally singletons in your application)
 eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
 snapshotStore := snapshotpostgres.NewStore(snapshotpostgres.DefaultStoreConfig())
 
 // 2. Define repository configuration
-config := snapshot.RepositoryConfig[*User]{
+config := snapshot.RepositoryConfig[*UserState]{
 	StreamType:    "User",
-	SchemaVersion: 1, // Current shape version of the User struct
+	SchemaVersion: 1, // Current version of the UserState struct shape
 
-	Initializer: func(id string) *User {
-		return &User{ID: id}
+	Initializer: func(id string) *UserState {
+		return &UserState{ID: id}
 	},
 
-	Apply: func(u *User, event store.PersistedEvent) (*User, error) {
-		// Apply event payload to mutate stream state
+	Apply: func(state *UserState, event store.PersistedEvent) (*UserState, error) {
 		switch event.EventType {
 		case "UserCreated":
-			// ...
+			// mutate state
+		case "UserEmailChanged":
+			// mutate state
 		}
-		return u, nil
+		return state, nil
 	},
 
-	Marshal: func(u *User) ([]byte, error) {
-		return json.Marshal(u)
+	Marshal: func(state *UserState) ([]byte, error) {
+		return json.Marshal(state)
 	},
 
-	Unmarshal: func(data []byte) (*User, error) {
-		var u User
-		if err := json.Unmarshal(data, &u); err != nil {
+	Unmarshal: func(data []byte) (*UserState, error) {
+		var state UserState
+		if err := json.Unmarshal(data, &state); err != nil {
 			return nil, err
 		}
-		return &u, nil
+		return &state, nil
 	},
 }
 
@@ -121,9 +124,11 @@ config := snapshot.RepositoryConfig[*User]{
 userRepo, err := snapshot.NewRepository(eventStore, snapshotStore, config)
 ```
 
-### 4. Load & Save in Command Handlers
+### 4. Loading & Saving Snapshots
 
-Your command handlers run within database transactions:
+#### Loading Rehydrated State
+
+`Load` retrieves the latest valid snapshot and replays subsequent delta events to reconstruct state up to the latest stream version:
 
 ```go
 tx, err := db.Begin(ctx)
@@ -132,50 +137,82 @@ if err != nil {
 }
 defer tx.Rollback(ctx)
 
-// Load rehydrates state from snapshot + delta events
 res, err := userRepo.Load(ctx, tx, userID)
 if err != nil {
 	return err
 }
-user := res.State
 
-// ... Execute business logic producing events ...
+// res contains:
+// - res.State:           the rehydrated *UserState
+// - res.StreamVersion:   current stream version (e.g. 150)
+// - res.SnapshotVersion: version where snapshot was loaded from (e.g. 100, or 0 if miss)
+// - res.SnapshotHit:     true if a matching snapshot was used
+// - res.EventsReplayed:  number of delta events read and applied (e.g. 50)
+```
 
-// Commit events to the event store
-result, err := eventStore.Append(ctx, tx, store.Exact(res.StreamVersion), newEvents)
+#### Saving Snapshots
+
+You can save a snapshot directly at a known stream version:
+
+```go
+err = userRepo.Save(ctx, tx, userID, streamVersion, state)
+if err != nil {
+	return err
+}
+```
+
+#### Append-Safe Persistence with `SaveAppended`
+
+When appending events to a stream, use `SaveAppended` to persist a snapshot safely. It folds the newly appended events from `store.AppendResult` into the state before writing the snapshot, ensuring the snapshot matches the new stream version:
+
+```go
+// 1. Load current state
+res, err := userRepo.Load(ctx, tx, userID)
 if err != nil {
 	return err
 }
 
-// Snapshot policy trigger (e.g. every 100 events)
+// 2. Append new events to the event store
+appendRes, err := eventStore.Append(ctx, tx, store.Exact(res.StreamVersion), events)
+if err != nil {
+	return err
+}
+
+// 3. Check snapshot policy and save safely
 policy := snapshot.EveryNEvents(100)
-if res.ShouldSnapshot(policy, int64(len(newEvents))) {
-	err = userRepo.Save(ctx, tx, userID, result.ToVersion(), user)
+if res.ShouldSnapshot(policy, int64(len(events))) {
+	updatedState, err := userRepo.SaveAppended(ctx, tx, userID, res.State, appendRes)
 	if err != nil {
 		return err
 	}
+	_ = updatedState
 }
 
 return tx.Commit(ctx)
 ```
 
+> [!WARNING]
+> Do not call `Save` using pre-append state with `appendRes.ToVersion()`. Passing state that has not had the newly appended events applied will record stale state in the snapshot. Always apply the newly appended events or use `SaveAppended`.
+
+---
+
 ## Best Practices & Architecture Details
 
 ### Schema Versioning & Stream Evolution
 
-When your domain model struct modifications break compatibility with previously serialized snapshot payloads:
+When your stream state struct shape changes in backwards-incompatible ways:
 1. Increment the `SchemaVersion` integer in your `RepositoryConfig`.
-2. When the application loads the stream state, the repository detects that the stored snapshot's schema version mismatches the configuration.
-3. It discards the snapshot and replays the entire event stream from version 1.
-4. When a snapshot is saved next, it will overwrite the old snapshot with the new schema version and structure.
+2. When loading state, the repository detects that the stored snapshot's `schema_version` does not match `SchemaVersion`.
+3. It safely discards the snapshot and replays the entire event stream from version 1.
+4. When a new snapshot is saved, it writes the updated `schema_version` and serialized payload.
 
 ### Decoupled Encryption
 
 In eventsalsa, sensitive fields (PII or secrets) are protected at the **field level** using custom value objects (e.g. `user.EncryptedEmail` strings) as explained in `eventsalsa/encryption` documentation. 
 
-Because of this design, the domain state fields itself already store encrypted ciphertext when in-memory. Therefore:
-- The standard serialization of the stream state (via `Marshal`) **automatically preserves** field-level encryption inside the snapshot payload.
-- You should **never** encrypt the full snapshot payload. Doing so is unnecessary, breaks payload inspectability, and deviates from eventsalsa's fine-grained field-level encryption boundaries.
+Because of this design, the state fields themselves already store ciphertext in memory. Therefore:
+- Standard serialization (via `Marshal`) automatically preserves field-level encryption inside the snapshot payload.
+- You should not encrypt the full snapshot payload. Doing so is unnecessary, breaks payload inspectability, and deviates from eventsalsa's fine-grained field-level encryption boundaries.
 
 ---
 
