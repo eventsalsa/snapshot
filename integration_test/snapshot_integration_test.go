@@ -452,6 +452,16 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 			return &TestUser{ID: id}
 		},
 		Apply: func(u *TestUser, e store.PersistedEvent) (*TestUser, error) {
+			var payload TestEvent
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				return nil, err
+			}
+			if payload.Name != "" {
+				u.Name = payload.Name
+			}
+			if payload.Email != "" {
+				u.Email = payload.Email
+			}
 			return u, nil
 		},
 		Marshal: func(u *TestUser) ([]byte, error) {
@@ -552,5 +562,76 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 	_, err = strictRepo.Load(ctx, tx, id)
 	if err == nil {
 		t.Error("expected load error in strict mode due to corrupt JSON unmarshal")
+	}
+
+	// 4. Save rejects snapshot when version does not exist in stream log
+	err = repo.Save(ctx, tx, id, 100, &TestUser{ID: id, Name: "NonExistent"})
+	if err == nil {
+		t.Fatal("expected error saving at non-existent stream version, got nil")
+	}
+
+	// 5. Snapshot ahead of stream log falls back to full stream replay
+	aheadID := uuid.New().String()
+	// Append 2 events
+	appendTestEvent(t, ctx, tx, es, aheadID, "UserCreated", "RealAlice", "alice@example.com", store.NoStream())
+	appendTestEvent(t, ctx, tx, es, aheadID, "UserUpdated", "RealAlice Updated", "", store.Exact(1))
+
+	// Manually inject a rogue snapshot claiming version 5000
+	rogueSnap := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      aheadID,
+		StreamVersion: 5000,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"id":"` + aheadID + `","name":"PhantomAlice"}`),
+	}
+	if err := ss.Put(ctx, tx, &rogueSnap); err != nil {
+		t.Fatalf("failed to insert rogue snapshot: %v", err)
+	}
+
+	resAhead, err := repo.Load(ctx, tx, aheadID)
+	if err != nil {
+		t.Fatalf("Load with ahead snapshot failed: %v", err)
+	}
+	if resAhead.SnapshotHit {
+		t.Errorf("expected SnapshotHit to be false for snapshot ahead of stream")
+	}
+	if resAhead.StreamVersion != 2 {
+		t.Errorf("expected StreamVersion 2, got %d", resAhead.StreamVersion)
+	}
+	if resAhead.EventsReplayed != 2 {
+		t.Errorf("expected EventsReplayed 2, got %d", resAhead.EventsReplayed)
+	}
+	if resAhead.State.Name != "RealAlice Updated" {
+		t.Errorf("expected state to be replayed from events ('RealAlice Updated'), got %q", resAhead.State.Name)
+	}
+
+	// 6. Orphan snapshot on empty stream falls back to initial state
+	orphanID := uuid.New().String()
+	orphanSnap := snapshot.Snapshot{
+		StreamType:    "User",
+		StreamID:      orphanID,
+		StreamVersion: 10,
+		SchemaVersion: 1,
+		Payload:       []byte(`{"id":"` + orphanID + `","name":"GhostAlice"}`),
+	}
+	if err := ss.Put(ctx, tx, &orphanSnap); err != nil {
+		t.Fatalf("failed to insert orphan snapshot: %v", err)
+	}
+
+	resOrphan, err := repo.Load(ctx, tx, orphanID)
+	if err != nil {
+		t.Fatalf("Load with orphan snapshot failed: %v", err)
+	}
+	if resOrphan.SnapshotHit {
+		t.Errorf("expected SnapshotHit to be false for orphan snapshot")
+	}
+	if resOrphan.StreamVersion != 0 {
+		t.Errorf("expected StreamVersion 0, got %d", resOrphan.StreamVersion)
+	}
+	if resOrphan.EventsReplayed != 0 {
+		t.Errorf("expected EventsReplayed 0, got %d", resOrphan.EventsReplayed)
+	}
+	if resOrphan.State.Name != "" {
+		t.Errorf("expected empty name for initial state, got %q", resOrphan.State.Name)
 	}
 }
