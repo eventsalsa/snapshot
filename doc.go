@@ -17,7 +17,18 @@
 // Example usage:
 //
 //	res, err := repo.Load(ctx, tx, userID)
-//	user := res.State
+//	if err != nil {
+//		return err
+//	}
 //	// ... run domain logic and append events ...
-//	err = repo.Save(ctx, tx, userID, newVersion, user)
+//	appendRes, err := eventStore.Append(ctx, tx, store.Exact(res.StreamVersion), events)
+//	if err != nil {
+//		return err
+//	}
+//	if res.ShouldSnapshot(snapshot.EveryNEvents(100), int64(len(events))) {
+//		_, err = repo.SaveAppended(ctx, tx, userID, res.State, appendRes)
+//		if err != nil {
+//			return err
+//		}
+//	}
 package snapshot
