@@ -16,6 +16,7 @@ It is designed to be used alongside [`github.com/eventsalsa/store`](https://gith
 - **Resilient Fallback**: Discards corrupt or unparseable snapshot payloads and recovers automatically via event log replay.
 - **Version Parity Guard**: Optional `Version` callback verifies aggregate state version against the snapshot version to prevent state desynchronization.
 - **Low-Level and High-Level APIs**: Exposes a raw byte `Store` interface alongside a high-level `Repository[T]`.
+- **Pluggable Codecs & Transport Transformers**: Decouple serialization format (`Codec[T]`, e.g., `snapshot.JSON[T]()`) from transport-level concerns (`PayloadTransformer` chain, such as gzip compression or envelope encryption).
 - **Migration Generation**: Comes with a built-in SQL migration generator and CLI tool to generate PostgreSQL tables.
 
 ---
@@ -74,7 +75,6 @@ Initialize the event store, snapshot store, and the generic snapshot repository:
 ```go
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/eventsalsa/snapshot"
 	snapshotpostgres "github.com/eventsalsa/snapshot/postgres"
@@ -105,17 +105,7 @@ config := snapshot.RepositoryConfig[*UserState]{
 		return state, nil
 	},
 
-	Marshal: func(state *UserState) ([]byte, error) {
-		return json.Marshal(state)
-	},
-
-	Unmarshal: func(streamID string, data []byte) (*UserState, error) {
-		var state UserState
-		if err := json.Unmarshal(data, &state); err != nil {
-			return nil, err
-		}
-		return &state, nil
-	},
+	Codec: snapshot.JSON[*UserState](),
 }
 
 // 3. Create the generic repository
@@ -208,13 +198,13 @@ When your stream state struct shape changes across versions:
 3. If an upcaster in the chain is missing or encounters an error, the repository safely falls back to replaying the entire event stream from version 1.
 4. During rolling deployments, older and newer service instances operate simultaneously against the compound primary key `(stream_type, stream_id, schema_version)` without overwriting each other's snapshots.
 
-### Decoupled Encryption
+### Decoupled Encryption & Transport Transformers
 
 In eventsalsa, sensitive fields (PII or secrets) are protected at the **field level** using custom value objects (e.g. `user.EncryptedEmail` strings) as explained in `eventsalsa/encryption` documentation. 
 
 Because of this design, the state fields themselves already store ciphertext in memory. Therefore:
-- Standard serialization (via `Marshal`) automatically preserves field-level encryption inside the snapshot payload.
-- You should not encrypt the full snapshot payload. Doing so is unnecessary, breaks payload inspectability, and deviates from eventsalsa's fine-grained field-level encryption boundaries.
+- Standard serialization (via `Codec[T]`) automatically preserves field-level encryption inside the snapshot payload.
+- If full-payload compression or envelope encryption is desired, implement it as a `PayloadTransformer` in the repository's `Transformers` chain (e.g. `snapshot.Gzip()`, envelope encryption). Transformers run outside the schema boundary, ensuring upcasters always operate on decoded plaintext.
 
 ### Table Disposability & Cache Semantics
 
