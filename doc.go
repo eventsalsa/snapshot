@@ -11,7 +11,7 @@
 //   - High-level orchestration: Repository[T] generic wrapper to automate the rehydration flow.
 //   - Schema evolution & upcasting: Automatic version-checking with sequential in-memory Upcasters to eliminate full replay spikes.
 //   - Resilient cache semantics: Snapshots are disposable; corrupted or missing snapshots transparently fall back to event replay.
-//   - Pluggable serialization: Customize JSON, Protobuf, or encryption behavior via callbacks.
+//   - Pluggable serialization and transport: a Codec[T] for the payload format, and a PayloadTransformer chain for compression or envelope encryption.
 //
 // The postgres package provides the PostgreSQL implementation of the Store interface.
 //

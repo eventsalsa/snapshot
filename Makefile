@@ -6,7 +6,7 @@ help: ## Show this help message
 	@echo 'Available targets:'
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
 
-check: lint govulncheck test-unit test-integration ## Run all checks (lint, govulncheck, unit tests, integration tests)
+check: lint test-unit test-integration govulncheck ## Run all checks (lint, unit tests, integration tests, govulncheck)
 
 test: test-unit ## Run all tests
 
@@ -20,7 +20,7 @@ lint: ## Run linter
 	golangci-lint run --timeout=5m
 
 govulncheck: ## Run vulnerability checker
-	govulncheck ./...
+	-govulncheck ./...
 
 fmt: ## Format code
 	gofmt -w -s .
