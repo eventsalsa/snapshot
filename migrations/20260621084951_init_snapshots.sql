@@ -1,7 +1,10 @@
 -- Snapshots DDL Migration
 -- Generated: 2026-06-21T08:49:51+02:00
+--
+-- Note: Snapshots contain derived, disposable cache data. This table can be
+-- safely truncated or dropped at any time without data loss; missing snapshots
+-- will be transparently rehydrated on demand by replaying the event store log.
 
--- Table to store stream state snapshots
 CREATE TABLE IF NOT EXISTS snapshots (
     stream_type TEXT NOT NULL,
     stream_id TEXT NOT NULL,
@@ -12,7 +15,3 @@ CREATE TABLE IF NOT EXISTS snapshots (
     
     PRIMARY KEY (stream_type, stream_id, schema_version)
 );
-
--- Index for schema version analysis/observability
-CREATE INDEX IF NOT EXISTS idx_snapshots_schema_version 
-    ON snapshots (schema_version);
