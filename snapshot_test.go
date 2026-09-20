@@ -89,16 +89,7 @@ func defaultTestConfig() snapshot.RepositoryConfig[*userState] {
 			}
 			return s, nil
 		},
-		Marshal: func(s *userState) ([]byte, error) {
-			return json.Marshal(s)
-		},
-		Unmarshal: func(_ string, data []byte) (*userState, error) {
-			var s userState
-			if err := json.Unmarshal(data, &s); err != nil {
-				return nil, err
-			}
-			return &s, nil
-		},
+		Codec: snapshot.JSON[*userState](),
 	}
 }
 
@@ -160,24 +151,14 @@ func TestNewRepository_Validation(t *testing.T) {
 			errSubstr: "apply cannot be nil",
 		},
 		{
-			name:   "nil marshal",
+			name:   "nil codec",
 			reader: reader,
 			store:  snapStore,
 			cfgMod: func(c *snapshot.RepositoryConfig[*userState]) {
-				c.Marshal = nil
+				c.Codec = nil
 			},
 			wantErr:   true,
-			errSubstr: "marshal cannot be nil",
-		},
-		{
-			name:   "nil unmarshal",
-			reader: reader,
-			store:  snapStore,
-			cfgMod: func(c *snapshot.RepositoryConfig[*userState]) {
-				c.Unmarshal = nil
-			},
-			wantErr:   true,
-			errSubstr: "unmarshal cannot be nil",
+			errSubstr: "codec cannot be nil",
 		},
 		{
 			name:   "zero schema version",
@@ -658,11 +639,14 @@ func TestRepository_Save(t *testing.T) {
 		}
 	})
 
-	t.Run("marshal error", func(t *testing.T) {
+	t.Run("codec encode error", func(t *testing.T) {
 		cfgErr := cfg
-		cfgErr.Marshal = func(_ *userState) ([]byte, error) {
-			return nil, errors.New("marshal error")
-		}
+		cfgErr.Codec = snapshot.FuncCodec(
+			func(_ *userState) ([]byte, error) {
+				return nil, errors.New("encode error")
+			},
+			nil,
+		)
 		reader := &mockStreamReader{
 			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _, _ *int64) (store.Stream, error) {
 				return store.Stream{
@@ -678,8 +662,8 @@ func TestRepository_Save(t *testing.T) {
 			t.Fatalf("NewRepository failed: %v", err)
 		}
 		err = repo.Save(ctx, nil, "user-1", 5, &userState{ID: "user-1"})
-		if err == nil || !strings.Contains(err.Error(), "marshal error") {
-			t.Fatalf("expected marshal error, got: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "failed to encode snapshot") {
+			t.Fatalf("expected encode error, got: %v", err)
 		}
 	})
 
@@ -1673,27 +1657,32 @@ func TestRepository_Upcasters(t *testing.T) {
 		}
 
 		_, err = repo.Load(ctx, nil, "user-1")
-		if err == nil || !strings.Contains(err.Error(), "failed to unmarshal snapshot") {
-			t.Fatalf("expected unmarshal error propagation, got: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "failed to decode snapshot") {
+			t.Fatalf("expected decode error propagation, got: %v", err)
 		}
 	})
 }
 
-func TestRepository_Unmarshal_StreamIDValidation(t *testing.T) {
+func TestRepository_Codec_StreamIDValidation(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("unmarshal receives streamID and can reject foreign stream payloads", func(t *testing.T) {
+	t.Run("decode receives streamID and can reject foreign stream payloads", func(t *testing.T) {
 		cfg := defaultTestConfig()
-		cfg.Unmarshal = func(streamID string, data []byte) (*userState, error) {
-			var s userState
-			if err := json.Unmarshal(data, &s); err != nil {
-				return nil, err
-			}
-			if s.ID != streamID {
-				return nil, fmt.Errorf("stream ID mismatch: expected %q, got %q", streamID, s.ID)
-			}
-			return &s, nil
-		}
+		cfg.Codec = snapshot.FuncCodec(
+			func(s *userState) ([]byte, error) {
+				return json.Marshal(s)
+			},
+			func(streamID string, data []byte) (*userState, error) {
+				var s userState
+				if err := json.Unmarshal(data, &s); err != nil {
+					return nil, err
+				}
+				if s.ID != streamID {
+					return nil, fmt.Errorf("stream ID mismatch: expected %q, got %q", streamID, s.ID)
+				}
+				return &s, nil
+			},
+		)
 
 		foreignPayload, err := json.Marshal(&userState{ID: "other-user", Name: "Foreign"})
 		if err != nil {
@@ -1805,7 +1794,7 @@ func TestRepository_VersionValidation(t *testing.T) {
 func TestRepository_OnSnapshotRejected(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("triggers OnSnapshotRejected on corrupt unmarshal", func(t *testing.T) {
+	t.Run("triggers OnSnapshotRejected on corrupt decode", func(t *testing.T) {
 		var rejectedStreamID, rejectedReason string
 		var rejectedErr error
 
@@ -1842,8 +1831,8 @@ func TestRepository_OnSnapshotRejected(t *testing.T) {
 		if rejectedStreamID != "user-corrupt" {
 			t.Errorf("expected rejectedStreamID = 'user-corrupt', got %q", rejectedStreamID)
 		}
-		if rejectedReason != "failed to unmarshal snapshot payload" {
-			t.Errorf("expected reason 'failed to unmarshal snapshot payload', got %q", rejectedReason)
+		if rejectedReason != "failed to decode snapshot payload" {
+			t.Errorf("expected reason 'failed to decode snapshot payload', got %q", rejectedReason)
 		}
 		if rejectedErr == nil {
 			t.Errorf("expected non-nil rejectedErr")
@@ -1931,6 +1920,109 @@ func TestRepository_OnSnapshotRejected(t *testing.T) {
 
 		if rejectedReason != "snapshot version 50 not found in event log" {
 			t.Errorf("expected reason 'snapshot version 50 not found in event log', got %q", rejectedReason)
+		}
+	})
+}
+
+func TestJSONCodec(t *testing.T) {
+	t.Run("pointer type encode and decode", func(t *testing.T) {
+		codec := snapshot.JSON[*userState]()
+		original := &userState{ID: "u-123", Name: "Alice", Email: "alice@example.com"}
+
+		data, err := codec.Encode(original)
+		if err != nil {
+			t.Fatalf("Encode failed: %v", err)
+		}
+
+		decoded, err := codec.Decode("u-123", data)
+		if err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+
+		if decoded == nil || decoded.ID != "u-123" || decoded.Name != "Alice" || decoded.Email != "alice@example.com" {
+			t.Errorf("unexpected decoded state: %+v", decoded)
+		}
+	})
+
+	t.Run("value type encode and decode", func(t *testing.T) {
+		codec := snapshot.JSON[userState]()
+		original := userState{ID: "u-456", Name: "Bob", Email: "bob@example.com"}
+
+		data, err := codec.Encode(original)
+		if err != nil {
+			t.Fatalf("Encode failed: %v", err)
+		}
+
+		decoded, err := codec.Decode("u-456", data)
+		if err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+
+		if decoded.ID != "u-456" || decoded.Name != "Bob" || decoded.Email != "bob@example.com" {
+			t.Errorf("unexpected decoded state: %+v", decoded)
+		}
+	})
+
+	t.Run("corrupt payload decode error", func(t *testing.T) {
+		codec := snapshot.JSON[*userState]()
+		_, err := codec.Decode("u-123", []byte(`{invalid-json`))
+		if err == nil {
+			t.Error("expected error for corrupt JSON payload")
+		}
+	})
+}
+
+func TestFuncCodec(t *testing.T) {
+	t.Run("successful encode and decode", func(t *testing.T) {
+		fc := snapshot.FuncCodec(
+			func(s *userState) ([]byte, error) {
+				return []byte(s.ID + ":" + s.Name), nil
+			},
+			func(streamID string, payload []byte) (*userState, error) {
+				if streamID == "" {
+					return nil, errors.New("empty streamID")
+				}
+				parts := strings.Split(string(payload), ":")
+				return &userState{ID: parts[0], Name: parts[1]}, nil
+			},
+		)
+
+		encoded, err := fc.Encode(&userState{ID: "u-1", Name: "Test"})
+		if err != nil {
+			t.Fatalf("Encode failed: %v", err)
+		}
+		if string(encoded) != "u-1:Test" {
+			t.Errorf("expected 'u-1:Test', got %q", string(encoded))
+		}
+
+		decoded, err := fc.Decode("u-1", encoded)
+		if err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+		if decoded.ID != "u-1" || decoded.Name != "Test" {
+			t.Errorf("unexpected decoded state: %+v", decoded)
+		}
+	})
+
+	t.Run("nil encode function returns error", func(t *testing.T) {
+		fc := snapshot.FuncCodec[*userState](nil, func(_ string, _ []byte) (*userState, error) {
+			return &userState{}, nil
+		})
+
+		_, err := fc.Encode(&userState{})
+		if err == nil || !strings.Contains(err.Error(), "encode func cannot be nil") {
+			t.Errorf("expected nil encode error, got: %v", err)
+		}
+	})
+
+	t.Run("nil decode function returns error", func(t *testing.T) {
+		fc := snapshot.FuncCodec[*userState](func(_ *userState) ([]byte, error) {
+			return []byte("data"), nil
+		}, nil)
+
+		_, err := fc.Decode("id", []byte("data"))
+		if err == nil || !strings.Contains(err.Error(), "decode func cannot be nil") {
+			t.Errorf("expected nil decode error, got: %v", err)
 		}
 	})
 }

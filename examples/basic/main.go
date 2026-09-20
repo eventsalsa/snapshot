@@ -96,17 +96,7 @@ func main() {
 			return u, nil
 		},
 
-		Marshal: func(u *User) ([]byte, error) {
-			return json.Marshal(u)
-		},
-
-		Unmarshal: func(streamID string, data []byte) (*User, error) {
-			var u User
-			if err := json.Unmarshal(data, &u); err != nil {
-				return nil, err
-			}
-			return &u, nil
-		},
+		Codec: snapshot.JSON[*User](),
 	}
 
 	repo, err := snapshot.NewRepository(eventStore, snapshotStore, repoConfig)

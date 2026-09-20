@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -84,6 +85,68 @@ func (r Result[T]) ShouldSnapshot(policy Policy, appendedCount int64) bool {
 // For example, an upcaster registered for version 1 transforms a schema version 1 payload into a schema version 2 payload.
 type Upcaster func(fromSchemaVersion int, payload []byte) ([]byte, error)
 
+// Codec converts a state value to and from its payload bytes.
+type Codec[T any] interface {
+	// Encode returns the serialized payload for state.
+	Encode(state T) ([]byte, error)
+
+	// Decode returns the state deserialized from payload. streamID is the target stream ID,
+	// allowing implementations to validate that the decoded state belongs to the requested stream.
+	Decode(streamID string, payload []byte) (T, error)
+}
+
+type jsonCodec[T any] struct{}
+
+func (j jsonCodec[T]) Encode(state T) ([]byte, error) {
+	return json.Marshal(state)
+}
+
+func (j jsonCodec[T]) Decode(_ string, payload []byte) (T, error) {
+	var state T
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+// JSON returns a default Codec backed by standard library encoding/json.
+// It handles both value and pointer state types and automatically honors
+// json.Marshaler and json.Unmarshaler implementations.
+func JSON[T any]() Codec[T] {
+	return jsonCodec[T]{}
+}
+
+type funcCodec[T any] struct {
+	encode func(state T) ([]byte, error)
+	decode func(streamID string, payload []byte) (T, error)
+}
+
+func (f funcCodec[T]) Encode(state T) ([]byte, error) {
+	if f.encode == nil {
+		return nil, fmt.Errorf("encode func cannot be nil")
+	}
+	return f.encode(state)
+}
+
+func (f funcCodec[T]) Decode(streamID string, payload []byte) (T, error) {
+	if f.decode == nil {
+		var zero T
+		return zero, fmt.Errorf("decode func cannot be nil")
+	}
+	return f.decode(streamID, payload)
+}
+
+// FuncCodec creates a Codec from explicit encode and decode functions.
+func FuncCodec[T any](
+	encode func(state T) ([]byte, error),
+	decode func(streamID string, payload []byte) (T, error),
+) Codec[T] {
+	return funcCodec[T]{
+		encode: encode,
+		decode: decode,
+	}
+}
+
 // Store defines the low-level persistence interface for snapshots.
 type Store interface {
 	// Get retrieves the snapshot for the given stream with the highest schema version <= maxSchemaVersion.
@@ -109,13 +172,9 @@ type RepositoryConfig[T any] struct {
 	// type-safe event mapping code, use github.com/eventsalsa/store/cmd/eventmap-gen.
 	Apply func(state T, event store.PersistedEvent) (T, error)
 
-	// Marshal serializes state T into bytes for snapshot persistence.
-	Marshal func(state T) ([]byte, error)
-
-	// Unmarshal deserializes raw snapshot bytes into state T.
-	// It receives the target streamID to allow validating that the deserialized state
-	// belongs to the requested stream.
-	Unmarshal func(streamID string, data []byte) (T, error)
+	// Codec converts state T to and from raw payload bytes.
+	// For standard JSON serialization, use snapshot.JSON[T]().
+	Codec Codec[T]
 
 	// Version optionally extracts the internal stream version from state T.
 	// When provided, Save verifies that Version(state) matches the target version.
@@ -137,7 +196,7 @@ type RepositoryConfig[T any] struct {
 	// SchemaVersion is the current snapshot schema version (must be > 0).
 	SchemaVersion int
 
-	// FailOnCorruptSnapshot determines whether snapshot unmarshal/upcast errors fail fast
+	// FailOnCorruptSnapshot determines whether snapshot decode/upcast errors fail fast
 	// (if true) or gracefully fall back to replaying all events from version 1 (if false, default).
 	FailOnCorruptSnapshot bool
 }
@@ -171,11 +230,8 @@ func NewRepository[T any](
 	if config.Apply == nil {
 		return nil, fmt.Errorf("apply cannot be nil")
 	}
-	if config.Marshal == nil {
-		return nil, fmt.Errorf("marshal cannot be nil")
-	}
-	if config.Unmarshal == nil {
-		return nil, fmt.Errorf("unmarshal cannot be nil")
+	if config.Codec == nil {
+		return nil, fmt.Errorf("codec cannot be nil")
 	}
 	if config.SchemaVersion <= 0 {
 		return nil, fmt.Errorf("schema version must be >= 1 (got %d); version 0 is reserved for uninitialized configuration", config.SchemaVersion)
@@ -305,13 +361,13 @@ func (r *Repository[T]) resolveSnapshot(ctx context.Context, id string, snap *Sn
 		return zero, false, false, nil
 	}
 
-	state, err = r.config.Unmarshal(id, payload)
+	state, err = r.config.Codec.Decode(id, payload)
 	if err != nil {
 		if r.config.FailOnCorruptSnapshot {
-			return zero, false, false, fmt.Errorf("failed to unmarshal snapshot: %w", err)
+			return zero, false, false, fmt.Errorf("failed to decode snapshot: %w", err)
 		}
 		if r.config.Logger != nil {
-			r.config.Logger.Error(ctx, "failed to unmarshal snapshot payload; falling back to full stream replay",
+			r.config.Logger.Error(ctx, "failed to decode snapshot payload; falling back to full stream replay",
 				"stream_type", r.config.StreamType,
 				"stream_id", id,
 				"stream_version", snap.StreamVersion,
@@ -320,7 +376,7 @@ func (r *Repository[T]) resolveSnapshot(ctx context.Context, id string, snap *Sn
 			)
 		}
 		if r.config.OnSnapshotRejected != nil {
-			r.config.OnSnapshotRejected(ctx, id, "failed to unmarshal snapshot payload", err)
+			r.config.OnSnapshotRejected(ctx, id, "failed to decode snapshot payload", err)
 		}
 		return zero, false, false, nil
 	}
@@ -439,9 +495,9 @@ func (r *Repository[T]) Save(ctx context.Context, tx pgx.Tx, id string, version 
 		return fmt.Errorf("cannot save snapshot at version %d: stream version does not exist in event log", version)
 	}
 
-	payload, err := r.config.Marshal(state)
+	payload, err := r.config.Codec.Encode(state)
 	if err != nil {
-		return fmt.Errorf("failed to marshal snapshot: %w", err)
+		return fmt.Errorf("failed to encode snapshot: %w", err)
 	}
 
 	snap := Snapshot{

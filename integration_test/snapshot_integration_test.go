@@ -436,16 +436,7 @@ func TestRepositoryRehydration(t *testing.T) {
 			}
 			return u, nil
 		},
-		Marshal: func(u *TestUser) ([]byte, error) {
-			return json.Marshal(u)
-		},
-		Unmarshal: func(streamID string, data []byte) (*TestUser, error) {
-			var u TestUser
-			if err := json.Unmarshal(data, &u); err != nil {
-				return nil, err
-			}
-			return &u, nil
-		},
+		Codec: snapshot.JSON[*TestUser](),
 	}
 
 	repo, err := snapshot.NewRepository(es, ss, config)
@@ -578,16 +569,7 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 			}
 			return u, nil
 		},
-		Marshal: func(u *TestUser) ([]byte, error) {
-			return json.Marshal(u)
-		},
-		Unmarshal: func(streamID string, data []byte) (*TestUser, error) {
-			var u TestUser
-			if err := json.Unmarshal(data, &u); err != nil {
-				return nil, err
-			}
-			return &u, nil
-		},
+		Codec: snapshot.JSON[*TestUser](),
 	}
 
 	id := uuid.New().String()
@@ -619,6 +601,14 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 		_, err := snapshot.NewRepository(es, ss, cfg)
 		if err == nil {
 			t.Error("expected error for nil Initializer")
+		}
+	})
+	t.Run("nil codec", func(t *testing.T) {
+		cfg := config
+		cfg.Codec = nil
+		_, err := snapshot.NewRepository(es, ss, cfg)
+		if err == nil {
+			t.Error("expected error for nil Codec")
 		}
 	})
 
@@ -791,16 +781,7 @@ func TestRepositoryMultiVersionRollingDeploymentAndUpcasting(t *testing.T) {
 			}
 			return state, nil
 		},
-		Marshal: func(state *TestUser) ([]byte, error) {
-			return json.Marshal(state)
-		},
-		Unmarshal: func(streamID string, data []byte) (*TestUser, error) {
-			var state TestUser
-			if err := json.Unmarshal(data, &state); err != nil {
-				return nil, err
-			}
-			return &state, nil
-		},
+		Codec: snapshot.JSON[*TestUser](),
 	}
 
 	// V2 configuration with Upcaster from Schema 1 -> Schema 2
@@ -823,16 +804,7 @@ func TestRepositoryMultiVersionRollingDeploymentAndUpcasting(t *testing.T) {
 			}
 			return state, nil
 		},
-		Marshal: func(state *TestUserV2) ([]byte, error) {
-			return json.Marshal(state)
-		},
-		Unmarshal: func(streamID string, data []byte) (*TestUserV2, error) {
-			var state TestUserV2
-			if err := json.Unmarshal(data, &state); err != nil {
-				return nil, err
-			}
-			return &state, nil
-		},
+		Codec: snapshot.JSON[*TestUserV2](),
 		Upcasters: map[int]snapshot.Upcaster{
 			1: func(fromVer int, payload []byte) ([]byte, error) {
 				var v1 TestUser
