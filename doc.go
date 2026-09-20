@@ -9,7 +9,8 @@
 //
 //   - Low-level persistence: Store interface for raw byte snapshot operations.
 //   - High-level orchestration: Repository[T] generic wrapper to automate the rehydration flow.
-//   - Schema evolution: Automatic version-checking that discards outdated snapshots and falls back to full replay.
+//   - Schema evolution & upcasting: Automatic version-checking with sequential in-memory Upcasters to eliminate full replay spikes.
+//   - Resilient cache semantics: Snapshots are disposable; corrupted or missing snapshots transparently fall back to event replay.
 //   - Pluggable serialization: Customize JSON, Protobuf, or encryption behavior via callbacks.
 //
 // The postgres package provides the PostgreSQL implementation of the Store interface.
