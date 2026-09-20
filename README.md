@@ -14,7 +14,7 @@ It is designed to be used alongside [`github.com/eventsalsa/store`](https://gith
 - **Compound Primary Key & Multi-Version Rolling Deploys**: Primary key `(stream_type, stream_id, schema_version)` allows older and newer application versions to read and write their own snapshots concurrently without overwriting each other.
 - **Sequential In-Memory Upcasters**: Convert older snapshot payloads on read via `Upcasters: map[int]Upcaster` to eliminate $O(N)$ event replay spikes during schema version migrations.
 - **Resilient Fallback**: Discards corrupt or unparseable snapshot payloads and recovers automatically via event log replay.
-- **Append-Safe Persistence**: Provides `SaveAppended` to fold newly appended events into aggregate state before snapshot write, preventing state regression.
+- **Version Parity Guard**: Optional `Version` callback verifies aggregate state version against the snapshot version to prevent state desynchronization.
 - **Low-Level and High-Level APIs**: Exposes a raw byte `Store` interface alongside a high-level `Repository[T]`.
 - **Migration Generation**: Comes with a built-in SQL migration generator and CLI tool to generate PostgreSQL tables.
 
@@ -112,7 +112,7 @@ config := snapshot.RepositoryConfig[*UserState]{
 		return json.Marshal(state)
 	},
 
-	Unmarshal: func(data []byte) (*UserState, error) {
+	Unmarshal: func(streamID string, data []byte) (*UserState, error) {
 		var state UserState
 		if err := json.Unmarshal(data, &state); err != nil {
 			return nil, err
@@ -149,14 +149,13 @@ if err != nil {
 // - res.SnapshotVersion:       version where snapshot was loaded from (e.g. 100, or 0 if miss)
 // - res.SnapshotHit:           true if a valid snapshot was used
 // - res.EventsReplayed:        number of delta events read and applied (e.g. 50)
-// - res.SchemaVersion:         target schema version (e.g. 2)
 // - res.SnapshotSchemaVersion: raw schema version of the loaded snapshot (e.g. 1, or 0 if miss)
 // - res.Upcasted:              true if an older snapshot was migrated via upcasters
 ```
 
 #### Saving Snapshots
 
-You can save a snapshot directly at a known stream version:
+Persist a snapshot of your stream state at a known version:
 
 ```go
 err = userRepo.Save(ctx, tx, userID, streamVersion, state)
@@ -165,9 +164,9 @@ if err != nil {
 }
 ```
 
-#### Append-Safe Persistence with `SaveAppended`
+#### Snapshotting After Appends with Policy Evaluation
 
-When appending events to a stream, use `SaveAppended` to persist a snapshot safely. It folds the newly appended events from `store.AppendResult` into the state before writing the snapshot, ensuring the snapshot matches the new stream version:
+Use `res.ShouldSnapshot` along with a `snapshot.Policy` to determine whether a snapshot should be taken following an append:
 
 ```go
 // 1. Load current state
@@ -176,27 +175,23 @@ if err != nil {
 	return err
 }
 
-// 2. Append new events to the event store
+// 2. Execute domain logic on aggregate and append new events
 appendRes, err := eventStore.Append(ctx, tx, store.Exact(res.StreamVersion), events)
 if err != nil {
 	return err
 }
 
-// 3. Check snapshot policy and save safely
+// 3. Check snapshot policy and save updated state
 policy := snapshot.EveryNEvents(100)
 if res.ShouldSnapshot(policy, int64(len(events))) {
-	updatedState, err := userRepo.SaveAppended(ctx, tx, userID, res.State, appendRes)
+	err = userRepo.Save(ctx, tx, userID, appendRes.ToVersion(), updatedUserState)
 	if err != nil {
 		return err
 	}
-	_ = updatedState
 }
 
 return tx.Commit(ctx)
 ```
-
-> [!WARNING]
-> Do not call `Save` using pre-append state with `appendRes.ToVersion()`. Passing state that has not had the newly appended events applied will record stale state in the snapshot. Always apply the newly appended events or use `SaveAppended`.
 
 ---
 

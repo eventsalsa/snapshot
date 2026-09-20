@@ -100,7 +100,7 @@ func main() {
 			return json.Marshal(u)
 		},
 
-		Unmarshal: func(data []byte) (*User, error) {
+		Unmarshal: func(streamID string, data []byte) (*User, error) {
 			var u User
 			if err := json.Unmarshal(data, &u); err != nil {
 				return nil, err
@@ -186,8 +186,8 @@ func main() {
 	_ = tx.Commit(ctx)
 	fmt.Printf("User is now at version: %d\n", currVer)
 
-	// --- Step 4: Rehydrate from events, append change, and safely save snapshot using SaveAppended ---
-	fmt.Println("\n--- Step 4: Appending change (v5) and saving snapshot safely using SaveAppended ---")
+	// --- Step 4: Rehydrate from events, append change, and save snapshot ---
+	fmt.Println("\n--- Step 4: Appending change (v5) and saving snapshot ---")
 	tx, err = db.Begin(ctx)
 	if err != nil {
 		log.Fatalf("Failed to begin tx: %v", err)
@@ -214,13 +214,15 @@ func main() {
 		log.Fatalf("Append v5 failed: %v", err)
 	}
 
-	// SaveAppended safely folds newly appended events into pre-append state before saving
-	updatedUser, err := repo.SaveAppended(ctx, tx, userID, res.State, appendRes)
+	// Update domain state and save snapshot at new stream version
+	user := res.State
+	user.Email = "alice.smith.hq@example.com"
+	err = repo.Save(ctx, tx, userID, appendRes.ToVersion(), user)
 	if err != nil {
-		log.Fatalf("SaveAppended failed: %v", err)
+		log.Fatalf("Save snapshot failed: %v", err)
 	}
 	_ = tx.Commit(ctx)
-	fmt.Printf("Snapshot saved safely at version %d with updated state: %+v\n", appendRes.ToVersion(), updatedUser)
+	fmt.Printf("Snapshot saved successfully at version %d with updated state: %+v\n", appendRes.ToVersion(), user)
 
 	// --- Step 5: Add more events (v6 & v7) ---
 	fmt.Println("\n--- Step 5: Appending events (v6 & v7) without taking a snapshot ---")

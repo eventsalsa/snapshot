@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -91,7 +92,7 @@ func defaultTestConfig() snapshot.RepositoryConfig[*userState] {
 		Marshal: func(s *userState) ([]byte, error) {
 			return json.Marshal(s)
 		},
-		Unmarshal: func(data []byte) (*userState, error) {
+		Unmarshal: func(_ string, data []byte) (*userState, error) {
 			var s userState
 			if err := json.Unmarshal(data, &s); err != nil {
 				return nil, err
@@ -855,9 +856,6 @@ func TestRepository_Load_Result(t *testing.T) {
 		if res.SnapshotVersion != 3 {
 			t.Errorf("expected SnapshotVersion 3, got %d", res.SnapshotVersion)
 		}
-		if res.SchemaVersion != 1 {
-			t.Errorf("expected SchemaVersion 1, got %d", res.SchemaVersion)
-		}
 		if res.StreamVersion != 5 {
 			t.Errorf("expected StreamVersion 5, got %d", res.StreamVersion)
 		}
@@ -1218,154 +1216,6 @@ func TestSnapshotPolicy(t *testing.T) {
 	})
 }
 
-func TestRepository_SaveAppended(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("applies events and saves snapshot at new version", func(t *testing.T) {
-		cfg := defaultTestConfig()
-		var savedSnap *snapshot.Snapshot
-		snapStore := &mockSnapshotStore{
-			putFunc: func(_ context.Context, _ pgx.Tx, snap *snapshot.Snapshot) error {
-				savedSnap = snap
-				return nil
-			},
-		}
-		reader := &mockStreamReader{
-			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, fromVersion, toVersion *int64) (store.Stream, error) {
-				if fromVersion != nil && toVersion != nil && *fromVersion == 5 && *toVersion == 5 {
-					return store.Stream{
-						StreamType: streamType,
-						StreamID:   streamID,
-						Events:     []store.PersistedEvent{{StreamVersion: 5}},
-					}, nil
-				}
-				return store.Stream{StreamType: streamType, StreamID: streamID}, nil
-			},
-		}
-		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
-		if err != nil {
-			t.Fatalf("NewRepository: %v", err)
-		}
-
-		initialState := &userState{ID: "user-1", Name: "Alice"}
-		ev1, err := json.Marshal(userEvent{Name: "Alice Smith"})
-		if err != nil {
-			t.Fatalf("marshal failed: %v", err)
-		}
-		ev2, err := json.Marshal(userEvent{Email: "alice@example.com"})
-		if err != nil {
-			t.Fatalf("marshal failed: %v", err)
-		}
-
-		appendResult := store.AppendResult{
-			Events: []store.PersistedEvent{
-				{StreamType: "User", StreamID: "user-1", StreamVersion: 4, Payload: ev1},
-				{StreamType: "User", StreamID: "user-1", StreamVersion: 5, Payload: ev2},
-			},
-		}
-
-		updatedState, err := repo.SaveAppended(ctx, nil, "user-1", initialState, appendResult)
-		if err != nil {
-			t.Fatalf("SaveAppended failed: %v", err)
-		}
-
-		if updatedState.Name != "Alice Smith" || updatedState.Email != "alice@example.com" {
-			t.Errorf("state not properly folded: %+v", updatedState)
-		}
-		if savedSnap == nil {
-			t.Fatal("expected snapshot to be saved")
-		}
-		if savedSnap.StreamVersion != 5 {
-			t.Errorf("expected snapshot version 5, got %d", savedSnap.StreamVersion)
-		}
-	})
-
-	t.Run("empty append result is no-op", func(t *testing.T) {
-		cfg := defaultTestConfig()
-		var savedSnap *snapshot.Snapshot
-		snapStore := &mockSnapshotStore{
-			putFunc: func(_ context.Context, _ pgx.Tx, snap *snapshot.Snapshot) error {
-				savedSnap = snap
-				return nil
-			},
-		}
-		repo, err := snapshot.NewRepository(&mockStreamReader{}, snapStore, cfg)
-		if err != nil {
-			t.Fatalf("NewRepository: %v", err)
-		}
-
-		initialState := &userState{ID: "user-1", Name: "Alice"}
-		updatedState, err := repo.SaveAppended(ctx, nil, "user-1", initialState, store.AppendResult{})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if updatedState != initialState {
-			t.Errorf("expected unchanged state")
-		}
-		if savedSnap != nil {
-			t.Error("expected no snapshot to be saved for empty append result")
-		}
-	})
-
-	t.Run("apply error propagates", func(t *testing.T) {
-		cfg := defaultTestConfig()
-		cfg.Apply = func(_ *userState, _ store.PersistedEvent) (*userState, error) {
-			return nil, errors.New("apply error")
-		}
-		repo, err := snapshot.NewRepository(&mockStreamReader{}, &mockSnapshotStore{}, cfg)
-		if err != nil {
-			t.Fatalf("NewRepository: %v", err)
-		}
-
-		initialState := &userState{ID: "user-1"}
-		appendResult := store.AppendResult{
-			Events: []store.PersistedEvent{
-				{StreamType: "User", StreamID: "user-1", StreamVersion: 1, Payload: []byte("{}")},
-			},
-		}
-		_, err = repo.SaveAppended(ctx, nil, "user-1", initialState, appendResult)
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
-	})
-
-	t.Run("save error propagates", func(t *testing.T) {
-		cfg := defaultTestConfig()
-		snapStore := &mockSnapshotStore{
-			putFunc: func(_ context.Context, _ pgx.Tx, _ *snapshot.Snapshot) error {
-				return errors.New("db write failure")
-			},
-		}
-		reader := &mockStreamReader{
-			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, fromVersion, toVersion *int64) (store.Stream, error) {
-				if fromVersion != nil && toVersion != nil && *fromVersion == 1 && *toVersion == 1 {
-					return store.Stream{
-						StreamType: streamType,
-						StreamID:   streamID,
-						Events:     []store.PersistedEvent{{StreamVersion: 1}},
-					}, nil
-				}
-				return store.Stream{StreamType: streamType, StreamID: streamID}, nil
-			},
-		}
-		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
-		if err != nil {
-			t.Fatalf("NewRepository: %v", err)
-		}
-
-		initialState := &userState{ID: "user-1"}
-		appendResult := store.AppendResult{
-			Events: []store.PersistedEvent{
-				{StreamType: "User", StreamID: "user-1", StreamVersion: 1, Payload: []byte("{}")},
-			},
-		}
-		_, err = repo.SaveAppended(ctx, nil, "user-1", initialState, appendResult)
-		if err == nil || !strings.Contains(err.Error(), "db write failure") {
-			t.Fatalf("expected db write failure propagation, got: %v", err)
-		}
-	})
-}
-
 func TestRepository_Upcasters(t *testing.T) {
 	ctx := context.Background()
 
@@ -1446,9 +1296,6 @@ func TestRepository_Upcasters(t *testing.T) {
 		}
 		if res.SnapshotSchemaVersion != 1 {
 			t.Errorf("expected SnapshotSchemaVersion = 1, got %d", res.SnapshotSchemaVersion)
-		}
-		if res.SchemaVersion != 2 {
-			t.Errorf("expected SchemaVersion = 2, got %d", res.SchemaVersion)
 		}
 		if res.SnapshotVersion != 5 {
 			t.Errorf("expected SnapshotVersion = 5, got %d", res.SnapshotVersion)
@@ -1544,9 +1391,6 @@ func TestRepository_Upcasters(t *testing.T) {
 		}
 		if res.SnapshotSchemaVersion != 1 {
 			t.Errorf("expected SnapshotSchemaVersion = 1, got %d", res.SnapshotSchemaVersion)
-		}
-		if res.SchemaVersion != 3 {
-			t.Errorf("expected SchemaVersion = 3, got %d", res.SchemaVersion)
 		}
 		if res.State.Name != "Bob (v2) (v3)" {
 			t.Errorf("expected Name = 'Bob (v2) (v3)', got %q", res.State.Name)
@@ -1831,6 +1675,262 @@ func TestRepository_Upcasters(t *testing.T) {
 		_, err = repo.Load(ctx, nil, "user-1")
 		if err == nil || !strings.Contains(err.Error(), "failed to unmarshal snapshot") {
 			t.Fatalf("expected unmarshal error propagation, got: %v", err)
+		}
+	})
+}
+
+func TestRepository_Unmarshal_StreamIDValidation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unmarshal receives streamID and can reject foreign stream payloads", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		cfg.Unmarshal = func(streamID string, data []byte) (*userState, error) {
+			var s userState
+			if err := json.Unmarshal(data, &s); err != nil {
+				return nil, err
+			}
+			if s.ID != streamID {
+				return nil, fmt.Errorf("stream ID mismatch: expected %q, got %q", streamID, s.ID)
+			}
+			return &s, nil
+		}
+
+		foreignPayload, err := json.Marshal(&userState{ID: "other-user", Name: "Foreign"})
+		if err != nil {
+			t.Fatalf("Marshal foreignPayload: %v", err)
+		}
+		snapStore := &mockSnapshotStore{
+			getFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _ int) (snapshot.Snapshot, error) {
+				return snapshot.Snapshot{
+					StreamType:    streamType,
+					StreamID:      streamID,
+					StreamVersion: 5,
+					SchemaVersion: 1,
+					Payload:       foreignPayload,
+				}, nil
+			},
+		}
+
+		reader := &mockStreamReader{
+			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, fromVersion, _ *int64) (store.Stream, error) {
+				// Fallback full replay from beginning
+				if fromVersion == nil {
+					return store.Stream{
+						StreamType: streamType,
+						StreamID:   streamID,
+						Events: []store.PersistedEvent{
+							{StreamVersion: 1, EventType: "UserCreated", Payload: []byte(`{"name":"Local"}`)},
+						},
+					}, nil
+				}
+				return store.Stream{StreamType: streamType, StreamID: streamID}, nil
+			},
+		}
+
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository failed: %v", err)
+		}
+
+		res, err := repo.Load(ctx, nil, "expected-user")
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		// Snapshot should be discarded because Unmarshal rejected the foreign payload, falling back to full replay
+		if res.SnapshotHit {
+			t.Errorf("expected SnapshotHit = false due to stream ID mismatch")
+		}
+		if res.StreamVersion != 1 {
+			t.Errorf("expected StreamVersion = 1 from replay, got %d", res.StreamVersion)
+		}
+		if res.State.Name != "Local" {
+			t.Errorf("expected state Name = 'Local', got %q", res.State.Name)
+		}
+	})
+}
+
+func TestRepository_VersionValidation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Save succeeds when Version matches expected version", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		cfg.Version = func(_ *userState) int64 {
+			return 10
+		}
+
+		reader := &mockStreamReader{
+			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _, _ *int64) (store.Stream, error) {
+				return store.Stream{
+					StreamType: streamType,
+					StreamID:   streamID,
+					Events: []store.PersistedEvent{
+						{StreamVersion: 10},
+					},
+				}, nil
+			},
+		}
+		snapStore := &mockSnapshotStore{}
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		err = repo.Save(ctx, nil, "u-1", 10, &userState{ID: "u-1", Name: "Alice"})
+		if err != nil {
+			t.Fatalf("expected Save to succeed, got: %v", err)
+		}
+	})
+
+	t.Run("Save fails when Version does not match expected version", func(t *testing.T) {
+		cfg := defaultTestConfig()
+		cfg.Version = func(_ *userState) int64 {
+			return 9 // Mismatched version
+		}
+
+		reader := &mockStreamReader{}
+		snapStore := &mockSnapshotStore{}
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		err = repo.Save(ctx, nil, "u-1", 10, &userState{ID: "u-1", Name: "Alice"})
+		if err == nil || !strings.Contains(err.Error(), "state version 9 does not match save version 10") {
+			t.Fatalf("expected version mismatch error, got: %v", err)
+		}
+	})
+}
+
+func TestRepository_OnSnapshotRejected(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("triggers OnSnapshotRejected on corrupt unmarshal", func(t *testing.T) {
+		var rejectedStreamID, rejectedReason string
+		var rejectedErr error
+
+		cfg := defaultTestConfig()
+		cfg.OnSnapshotRejected = func(_ context.Context, streamID, reason string, err error) {
+			rejectedStreamID = streamID
+			rejectedReason = reason
+			rejectedErr = err
+		}
+
+		snapStore := &mockSnapshotStore{
+			getFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _ int) (snapshot.Snapshot, error) {
+				return snapshot.Snapshot{
+					StreamType:    streamType,
+					StreamID:      streamID,
+					StreamVersion: 5,
+					SchemaVersion: 1,
+					Payload:       []byte("invalid json"),
+				}, nil
+			},
+		}
+
+		reader := &mockStreamReader{}
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		_, err = repo.Load(ctx, nil, "user-corrupt")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if rejectedStreamID != "user-corrupt" {
+			t.Errorf("expected rejectedStreamID = 'user-corrupt', got %q", rejectedStreamID)
+		}
+		if rejectedReason != "failed to unmarshal snapshot payload" {
+			t.Errorf("expected reason 'failed to unmarshal snapshot payload', got %q", rejectedReason)
+		}
+		if rejectedErr == nil {
+			t.Errorf("expected non-nil rejectedErr")
+		}
+	})
+
+	t.Run("triggers OnSnapshotRejected on newer schema version", func(t *testing.T) {
+		var rejectedReason string
+
+		cfg := defaultTestConfig()
+		cfg.SchemaVersion = 1
+		cfg.OnSnapshotRejected = func(_ context.Context, _, reason string, _ error) {
+			rejectedReason = reason
+		}
+
+		snapStore := &mockSnapshotStore{
+			getFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _ int) (snapshot.Snapshot, error) {
+				return snapshot.Snapshot{
+					StreamType:    streamType,
+					StreamID:      streamID,
+					StreamVersion: 5,
+					SchemaVersion: 2, // Newer than cfg.SchemaVersion (1)
+					Payload:       []byte(`{"id":"u1"}`),
+				}, nil
+			},
+		}
+
+		reader := &mockStreamReader{}
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		_, err = repo.Load(ctx, nil, "user-newer-schema")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if rejectedReason != "snapshot schema version is newer than configured repository schema version" {
+			t.Errorf("expected reason 'snapshot schema version is newer than configured repository schema version', got %q", rejectedReason)
+		}
+	})
+
+	t.Run("triggers OnSnapshotRejected when snapshot version not found in event log", func(t *testing.T) {
+		var rejectedReason string
+
+		payload, err := json.Marshal(&userState{ID: "u-1", Name: "Valid"})
+		if err != nil {
+			t.Fatalf("Marshal payload: %v", err)
+		}
+		cfg := defaultTestConfig()
+		cfg.OnSnapshotRejected = func(_ context.Context, _, reason string, _ error) {
+			rejectedReason = reason
+		}
+
+		snapStore := &mockSnapshotStore{
+			getFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _ int) (snapshot.Snapshot, error) {
+				return snapshot.Snapshot{
+					StreamType:    streamType,
+					StreamID:      streamID,
+					StreamVersion: 50,
+					SchemaVersion: 1,
+					Payload:       payload,
+				}, nil
+			},
+		}
+
+		reader := &mockStreamReader{
+			readStreamFunc: func(_ context.Context, _ pgx.Tx, streamType, streamID string, _, _ *int64) (store.Stream, error) {
+				// fromVersion 51 -> empty delta
+				// verify check at 50 -> empty stream (head does not reach 50)
+				return store.Stream{StreamType: streamType, StreamID: streamID}, nil
+			},
+		}
+
+		repo, err := snapshot.NewRepository(reader, snapStore, cfg)
+		if err != nil {
+			t.Fatalf("NewRepository: %v", err)
+		}
+
+		_, err = repo.Load(ctx, nil, "u-1")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if rejectedReason != "snapshot version 50 not found in event log" {
+			t.Errorf("expected reason 'snapshot version 50 not found in event log', got %q", rejectedReason)
 		}
 	})
 }

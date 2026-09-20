@@ -26,7 +26,7 @@
 //		return err
 //	}
 //	if res.ShouldSnapshot(snapshot.EveryNEvents(100), int64(len(events))) {
-//		_, err = repo.SaveAppended(ctx, tx, userID, res.State, appendRes)
+//		err = repo.Save(ctx, tx, userID, appendRes.ToVersion(), updatedUser)
 //		if err != nil {
 //			return err
 //		}

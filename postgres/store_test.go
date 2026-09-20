@@ -52,3 +52,22 @@ func TestStoreConfig(t *testing.T) {
 		}
 	})
 }
+
+func TestStore_Get_Validation(t *testing.T) {
+	store := snapshotpostgres.NewStore(snapshotpostgres.DefaultStoreConfig())
+	ctx := context.Background()
+
+	t.Run("zero maxSchemaVersion returns error", func(t *testing.T) {
+		_, err := store.Get(ctx, nil, "User", "u-1", 0)
+		if err == nil || err.Error() != "maxSchemaVersion must be > 0 (got 0)" {
+			t.Fatalf("expected maxSchemaVersion error, got: %v", err)
+		}
+	})
+
+	t.Run("negative maxSchemaVersion returns error", func(t *testing.T) {
+		_, err := store.Get(ctx, nil, "User", "u-1", -5)
+		if err == nil || err.Error() != "maxSchemaVersion must be > 0 (got -5)" {
+			t.Fatalf("expected maxSchemaVersion error, got: %v", err)
+		}
+	})
+}
