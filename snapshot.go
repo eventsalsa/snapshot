@@ -1,9 +1,12 @@
 package snapshot
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/eventsalsa/store"
@@ -147,6 +150,92 @@ func FuncCodec[T any](
 	}
 }
 
+// PayloadTransformer transforms raw snapshot payload bytes on write and read paths.
+// Examples include wire compression (e.g. Gzip), envelope encryption, or framing.
+// Transformers operate strictly outside the schema versioning boundary; upcasters always
+// operate on restored plaintext bytes.
+type PayloadTransformer interface {
+	// Transform applies the transformation to plaintext payload bytes before storage (e.g., compress).
+	Transform(ctx context.Context, payload []byte) ([]byte, error)
+
+	// Restore reverses the transformation on stored bytes to produce plaintext bytes (e.g., decompress).
+	Restore(ctx context.Context, payload []byte) ([]byte, error)
+}
+
+type gzipTransformer struct {
+	level int
+}
+
+// Gzip returns a PayloadTransformer that compresses payloads using gzip.
+// An optional compression level can be provided (defaulting to gzip.DefaultCompression).
+func Gzip(level ...int) PayloadTransformer {
+	lvl := gzip.DefaultCompression
+	if len(level) > 0 {
+		lvl = level[0]
+	}
+	return &gzipTransformer{level: lvl}
+}
+
+func (g *gzipTransformer) Transform(_ context.Context, payload []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w, err := gzip.NewWriterLevel(&buf, g.level)
+	if err != nil {
+		return nil, fmt.Errorf("gzip new writer failed: %w", err)
+	}
+	if _, err := w.Write(payload); err != nil {
+		_ = w.Close()
+		return nil, fmt.Errorf("gzip write failed: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("gzip close failed: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func (g *gzipTransformer) Restore(_ context.Context, payload []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("gzip new reader failed: %w", err)
+	}
+	defer r.Close()
+
+	decompressed, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("gzip read failed: %w", err)
+	}
+	return decompressed, nil
+}
+
+type funcTransformer struct {
+	transform func(ctx context.Context, payload []byte) ([]byte, error)
+	restore   func(ctx context.Context, payload []byte) ([]byte, error)
+}
+
+func (f *funcTransformer) Transform(ctx context.Context, payload []byte) ([]byte, error) {
+	if f.transform == nil {
+		return nil, fmt.Errorf("transform func cannot be nil")
+	}
+	return f.transform(ctx, payload)
+}
+
+func (f *funcTransformer) Restore(ctx context.Context, payload []byte) ([]byte, error) {
+	if f.restore == nil {
+		return nil, fmt.Errorf("restore func cannot be nil")
+	}
+	return f.restore(ctx, payload)
+}
+
+// FuncTransformer creates a PayloadTransformer from explicit transform and restore functions.
+func FuncTransformer(
+	transform func(ctx context.Context, payload []byte) ([]byte, error),
+	restore func(ctx context.Context, payload []byte) ([]byte, error),
+) PayloadTransformer {
+	return &funcTransformer{
+		transform: transform,
+		restore:   restore,
+	}
+}
+
 // Store defines the low-level persistence interface for snapshots.
 type Store interface {
 	// Get retrieves the snapshot for the given stream with the highest schema version <= maxSchemaVersion.
@@ -164,6 +253,10 @@ type RepositoryConfig[T any] struct {
 	// Logger provides structured logging for repository events, warnings, and fallbacks.
 	Logger store.Logger
 
+	// Codec converts state T to and from raw payload bytes.
+	// For standard JSON serialization, use snapshot.JSON[T]().
+	Codec Codec[T]
+
 	// Initializer creates a blank state for a new stream with the given id.
 	Initializer func(id string) T
 
@@ -171,10 +264,6 @@ type RepositoryConfig[T any] struct {
 	// Tip: To keep domain aggregates decoupled from store.PersistedEvent and auto-generate
 	// type-safe event mapping code, use github.com/eventsalsa/store/cmd/eventmap-gen.
 	Apply func(state T, event store.PersistedEvent) (T, error)
-
-	// Codec converts state T to and from raw payload bytes.
-	// For standard JSON serialization, use snapshot.JSON[T]().
-	Codec Codec[T]
 
 	// Version optionally extracts the internal stream version from state T.
 	// When provided, Save verifies that Version(state) matches the target version.
@@ -192,6 +281,13 @@ type RepositoryConfig[T any] struct {
 	// Load will find no events or snapshots and will return the initialized state at version 0
 	// without returning an error (empty stream semantics).
 	StreamType string
+
+	// Transformers specifies an ordered chain of payload transformers (e.g. Gzip, envelope encryption)
+	// applied outside the schema versioning boundary.
+	// On Save (outbound), transformers execute in forward order (0 .. N-1).
+	// On Load (inbound), transformers restore in reverse order (N-1 .. 0).
+	// Upcasters always operate on restored plaintext bytes.
+	Transformers []PayloadTransformer
 
 	// SchemaVersion is the current snapshot schema version (must be > 0).
 	SchemaVersion int
@@ -245,6 +341,11 @@ func NewRepository[T any](
 		}
 		if u == nil {
 			return nil, fmt.Errorf("nil upcaster configured for schema version %d", v)
+		}
+	}
+	for i, t := range config.Transformers {
+		if t == nil {
+			return nil, fmt.Errorf("nil transformer configured at index %d", i)
 		}
 	}
 	return &Repository[T]{
@@ -338,15 +439,42 @@ func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Res
 }
 
 func (r *Repository[T]) resolveSnapshot(ctx context.Context, id string, snap *Snapshot) (state T, ok, upcasted bool, err error) {
-	var payload []byte
 	var zero T
 
+	// 1. Inbound transport: restore raw bytes in reverse order (N-1 .. 0) to obtain plaintext at snap.SchemaVersion
+	rawPayload := snap.Payload
+	for i := len(r.config.Transformers) - 1; i >= 0; i-- {
+		var restoreErr error
+		rawPayload, restoreErr = r.config.Transformers[i].Restore(ctx, rawPayload)
+		if restoreErr != nil {
+			if r.config.FailOnCorruptSnapshot {
+				return zero, false, false, fmt.Errorf("transformer %d failed to restore snapshot payload: %w", i, restoreErr)
+			}
+			if r.config.Logger != nil {
+				r.config.Logger.Error(ctx, "failed to restore snapshot payload; falling back to full stream replay",
+					"stream_type", r.config.StreamType,
+					"stream_id", id,
+					"stream_version", snap.StreamVersion,
+					"schema_version", snap.SchemaVersion,
+					"transformer_index", i,
+					"error", restoreErr,
+				)
+			}
+			if r.config.OnSnapshotRejected != nil {
+				r.config.OnSnapshotRejected(ctx, id, fmt.Sprintf("transformer %d failed to restore snapshot payload", i), restoreErr)
+			}
+			return zero, false, false, nil
+		}
+	}
+
+	// 2. Upcasters: sequentially transform plaintext bytes from snap.SchemaVersion to current SchemaVersion
+	var payload []byte
 	switch {
 	case snap.SchemaVersion == r.config.SchemaVersion:
-		payload = snap.Payload
+		payload = rawPayload
 	case snap.SchemaVersion < r.config.SchemaVersion:
 		var chainOK bool
-		payload, chainOK, err = r.upcastPayload(ctx, id, snap)
+		payload, chainOK, err = r.upcastPayload(ctx, id, snap.SchemaVersion, rawPayload)
 		if err != nil {
 			return zero, false, false, err
 		}
@@ -361,6 +489,7 @@ func (r *Repository[T]) resolveSnapshot(ctx context.Context, id string, snap *Sn
 		return zero, false, false, nil
 	}
 
+	// 3. Codec: decode plaintext bytes at current SchemaVersion into domain state
 	state, err = r.config.Codec.Decode(id, payload)
 	if err != nil {
 		if r.config.FailOnCorruptSnapshot {
@@ -384,9 +513,9 @@ func (r *Repository[T]) resolveSnapshot(ctx context.Context, id string, snap *Sn
 	return state, true, upcasted, nil
 }
 
-func (r *Repository[T]) upcastPayload(ctx context.Context, id string, snap *Snapshot) (payload []byte, complete bool, err error) {
-	currentPayload := snap.Payload
-	currentVer := snap.SchemaVersion
+func (r *Repository[T]) upcastPayload(ctx context.Context, id string, startVersion int, initialPayload []byte) (payload []byte, complete bool, err error) {
+	currentPayload := initialPayload
+	currentVer := startVersion
 
 	for currentVer < r.config.SchemaVersion {
 		upcaster, ok := r.config.Upcasters[currentVer]
@@ -498,6 +627,13 @@ func (r *Repository[T]) Save(ctx context.Context, tx pgx.Tx, id string, version 
 	payload, err := r.config.Codec.Encode(state)
 	if err != nil {
 		return fmt.Errorf("failed to encode snapshot: %w", err)
+	}
+
+	for i, t := range r.config.Transformers {
+		payload, err = t.Transform(ctx, payload)
+		if err != nil {
+			return fmt.Errorf("transformer %d failed to transform snapshot payload: %w", i, err)
+		}
 	}
 
 	snap := Snapshot{
