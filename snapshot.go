@@ -98,16 +98,47 @@ type Store interface {
 
 // RepositoryConfig contains configuration for the generic Repository.
 type RepositoryConfig[T any] struct {
-	Logger                store.Logger
-	Initializer           func(id string) T
-	Apply                 func(state T, event store.PersistedEvent) (T, error)
-	Marshal               func(state T) ([]byte, error)
-	Unmarshal             func(streamID string, data []byte) (T, error)
-	Version               func(state T) int64
-	OnSnapshotRejected    func(ctx context.Context, streamID string, reason string, err error)
-	Upcasters             map[int]Upcaster
-	StreamType            string
-	SchemaVersion         int
+	// Logger provides structured logging for repository events, warnings, and fallbacks.
+	Logger store.Logger
+
+	// Initializer creates a blank state for a new stream with the given id.
+	Initializer func(id string) T
+
+	// Apply folds an event from the event store into state T.
+	// Tip: To keep domain aggregates decoupled from store.PersistedEvent and auto-generate
+	// type-safe event mapping code, use github.com/eventsalsa/store/cmd/eventmap-gen.
+	Apply func(state T, event store.PersistedEvent) (T, error)
+
+	// Marshal serializes state T into bytes for snapshot persistence.
+	Marshal func(state T) ([]byte, error)
+
+	// Unmarshal deserializes raw snapshot bytes into state T.
+	// It receives the target streamID to allow validating that the deserialized state
+	// belongs to the requested stream.
+	Unmarshal func(streamID string, data []byte) (T, error)
+
+	// Version optionally extracts the internal stream version from state T.
+	// When provided, Save verifies that Version(state) matches the target version.
+	Version func(state T) int64
+
+	// OnSnapshotRejected is an optional hook called when a snapshot cannot be used
+	// (e.g., corrupt payload, missing upcaster, schema mismatch, or version absent in log).
+	OnSnapshotRejected func(ctx context.Context, streamID string, reason string, err error)
+
+	// Upcasters provides sequential payload transformations across schema versions (e.g. 1 -> 2).
+	Upcasters map[int]Upcaster
+
+	// StreamType identifies the partition/category of the stream in the event store.
+	// Note: If StreamType does not match the type used when events were written,
+	// Load will find no events or snapshots and will return the initialized state at version 0
+	// without returning an error (empty stream semantics).
+	StreamType string
+
+	// SchemaVersion is the current snapshot schema version (must be > 0).
+	SchemaVersion int
+
+	// FailOnCorruptSnapshot determines whether snapshot unmarshal/upcast errors fail fast
+	// (if true) or gracefully fall back to replaying all events from version 1 (if false, default).
 	FailOnCorruptSnapshot bool
 }
 
@@ -170,8 +201,14 @@ func NewRepository[T any](
 // Load rehydrates the stream state up to its current version.
 // First, it attempts to load the latest snapshot <= current SchemaVersion. If a valid
 // snapshot is found matching or upcastable to the configured SchemaVersion, it
-// deserializes the state and reads newer events starting from version S + 1.
+// deserializes the state and reads newer delta events starting from version S + 1.
 // Otherwise, it initializes a new state and reads all events from the beginning.
+//
+// Empty stream semantics:
+// If the stream does not exist in the event store, or if the configured StreamType
+// does not match what events were written under, Load returns Initializer(id) at
+// StreamVersion 0 with err == nil. Callers should ensure StreamType matches between
+// writers and the repository.
 func (r *Repository[T]) Load(ctx context.Context, tx pgx.Tx, id string) (res Result[T], err error) {
 	snap, err := r.snapshotStore.Get(ctx, tx, r.config.StreamType, id, r.config.SchemaVersion)
 	if err != nil {
@@ -338,6 +375,22 @@ func (r *Repository[T]) upcastPayload(ctx context.Context, id string, snap *Snap
 	return currentPayload, true, nil
 }
 
+// verifySnapshotInStream validates that the snapshot's StreamVersion actually exists in the event log.
+//
+// In an append-only, contiguous event log, if delta events exist (len(stream.Events) > 0),
+// the existence of version S is guaranteed without needing an extra read.
+//
+// When the snapshot is at head (len(stream.Events) == 0), the delta query (from=S+1, to=nil) returns 0 events.
+// An empty delta cannot distinguish between a valid snapshot at the stream head versus an orphan or
+// phantom snapshot written beyond the head of the log.
+//
+// Therefore, verifySnapshotInStream performs a single-event read (from=S, to=S) to confirm that
+// version S genuinely exists in the event store. While this costs one extra event-log read in the
+// snapshot-at-head idle case, it prevents trusting snapshots beyond the head of the log.
+//
+// Note on physical log truncation: This check assumes the event log is contiguous from the oldest
+// snapshot onwards. If event streams are physically truncated or pruned, snapshots older than the
+// retention horizon should be pruned concurrently to prevent verification failure.
 func (r *Repository[T]) verifySnapshotInStream(ctx context.Context, tx pgx.Tx, id string, snap *Snapshot) (store.Stream, bool, error) {
 	headCheck, err := r.reader.ReadStream(ctx, tx, r.config.StreamType, id, &snap.StreamVersion, &snap.StreamVersion)
 	if err != nil {

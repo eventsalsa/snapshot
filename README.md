@@ -122,6 +122,12 @@ config := snapshot.RepositoryConfig[*UserState]{
 userRepo, err := snapshot.NewRepository(eventStore, snapshotStore, config)
 ```
 
+> [!TIP]
+> **Domain Purity with Codegen**: To avoid manual unmarshaling and type switches in `Apply`, use [`eventsalsa/store/cmd/eventmap-gen`](https://github.com/eventsalsa/store/tree/main/cmd/eventmap-gen). It generates type-safe mappings between `store.PersistedEvent` and your typed domain events (`ToESEvents` and `FromESEvents[T]`), keeping your domain layer clean and decoupled from store infrastructure.
+
+> [!NOTE]
+> **Stream Type Matching**: Streams are partitioned by `StreamType`. If `StreamType` in `RepositoryConfig` does not match the type used when events were written, `Load` will find 0 events and 0 snapshots and will return the initialized state at version 0 (empty stream semantics) without returning an error. Ensure the configured `StreamType` matches your event store writer configuration.
+
 ### 4. Loading & Saving Snapshots
 
 #### Loading Rehydrated State
@@ -230,6 +236,13 @@ DELETE FROM snapshots WHERE schema_version < $1;
 
 > [!WARNING]
 > **Rollback Tradeoff**: Deleting rows for older schema versions forfeits instant snapshot-assisted rollbacks for those versions. If a rollback to an older service release occurs after pruning, that service will fall back to replaying full event streams from the log.
+
+### Event Log Contiguity & Head Verification
+
+To maintain data integrity and prevent trusting corrupted or orphan snapshots:
+- **Delta Verification**: When events exist past the snapshot version (`EventsReplayed > 0`), the existence of the snapshot version in the event log is inherently guaranteed by the append-only, contiguous nature of `eventsalsa/store`.
+- **Snapshot at Head**: When a loaded snapshot is already at the stream head (`EventsReplayed == 0`), an empty delta query does not differentiate between a valid snapshot and a phantom snapshot written beyond the head. `Repository` deliberately executes a single-event read (`ReadStream(..., S, S)`) to verify that version `S` legitimately exists in the log. If missing, it rejects the snapshot and replays from version 1.
+- **Physical Log Truncation**: If your event store physically truncates or prunes events older than a given retention horizon, ensure snapshots older than that horizon are pruned concurrently so snapshot-at-head verifications remain consistent with the log.
 
 ---
 
