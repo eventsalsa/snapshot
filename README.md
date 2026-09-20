@@ -112,7 +112,7 @@ config := snapshot.RepositoryConfig[*UserState]{
 		return json.Marshal(state)
 	},
 
-	Unmarshal: func(data []byte) (*UserState, error) {
+	Unmarshal: func(streamID string, data []byte) (*UserState, error) {
 		var state UserState
 		if err := json.Unmarshal(data, &state); err != nil {
 			return nil, err
@@ -149,7 +149,6 @@ if err != nil {
 // - res.SnapshotVersion:       version where snapshot was loaded from (e.g. 100, or 0 if miss)
 // - res.SnapshotHit:           true if a valid snapshot was used
 // - res.EventsReplayed:        number of delta events read and applied (e.g. 50)
-// - res.SchemaVersion:         target schema version (e.g. 2)
 // - res.SnapshotSchemaVersion: raw schema version of the loaded snapshot (e.g. 1, or 0 if miss)
 // - res.Upcasted:              true if an older snapshot was migrated via upcasters
 ```

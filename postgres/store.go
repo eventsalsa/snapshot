@@ -71,9 +71,13 @@ func NewStore(config *StoreConfig) *Store {
 
 // Get implements snapshot.Store.
 // It retrieves the snapshot for the given stream with the highest schema version <= maxSchemaVersion.
-// If maxSchemaVersion <= 0, it retrieves the latest snapshot without schema version filtering.
+// maxSchemaVersion must be greater than 0.
 // Returns a zero Snapshot and nil if no snapshot exists.
 func (s *Store) Get(ctx context.Context, tx pgx.Tx, streamType, streamID string, maxSchemaVersion int) (snapshot.Snapshot, error) {
+	if maxSchemaVersion <= 0 {
+		return snapshot.Snapshot{}, fmt.Errorf("maxSchemaVersion must be > 0 (got %d)", maxSchemaVersion)
+	}
+
 	if s.config.Logger != nil {
 		s.config.Logger.Debug(ctx, "fetching snapshot",
 			"stream_type", streamType,
@@ -81,29 +85,15 @@ func (s *Store) Get(ctx context.Context, tx pgx.Tx, streamType, streamID string,
 			"max_schema_version", maxSchemaVersion)
 	}
 
-	var query string
-	var args []any
-	if maxSchemaVersion > 0 {
-		//nolint:gosec // G201: table name from trusted config, not user input
-		query = fmt.Sprintf(`
-			SELECT stream_version, schema_version, payload, created_at 
-			FROM %s 
-			WHERE stream_type = $1 AND stream_id = $2 AND schema_version <= $3
-			ORDER BY schema_version DESC
-			LIMIT 1
-		`, s.config.SnapshotsTable)
-		args = []any{streamType, streamID, maxSchemaVersion}
-	} else {
-		//nolint:gosec // G201: table name from trusted config, not user input
-		query = fmt.Sprintf(`
-			SELECT stream_version, schema_version, payload, created_at 
-			FROM %s 
-			WHERE stream_type = $1 AND stream_id = $2
-			ORDER BY schema_version DESC
-			LIMIT 1
-		`, s.config.SnapshotsTable)
-		args = []any{streamType, streamID}
-	}
+	//nolint:gosec // G201: table name from trusted config, not user input
+	query := fmt.Sprintf(`
+		SELECT stream_version, schema_version, payload, created_at 
+		FROM %s 
+		WHERE stream_type = $1 AND stream_id = $2 AND schema_version <= $3
+		ORDER BY schema_version DESC
+		LIMIT 1
+	`, s.config.SnapshotsTable)
+	args := []any{streamType, streamID, maxSchemaVersion}
 
 	var snap snapshot.Snapshot
 	snap.StreamType = streamType

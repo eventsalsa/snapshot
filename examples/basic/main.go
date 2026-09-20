@@ -100,7 +100,7 @@ func main() {
 			return json.Marshal(u)
 		},
 
-		Unmarshal: func(data []byte) (*User, error) {
+		Unmarshal: func(streamID string, data []byte) (*User, error) {
 			var u User
 			if err := json.Unmarshal(data, &u); err != nil {
 				return nil, err

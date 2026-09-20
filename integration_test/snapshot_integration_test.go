@@ -351,13 +351,10 @@ func TestRawStoreMultiVersionCoexistence(t *testing.T) {
 		t.Errorf("expected schema 2 at stream version 12, got schema %d at version %d", gotV2.SchemaVersion, gotV2.StreamVersion)
 	}
 
-	// Query with maxSchemaVersion <= 0 returns the highest schema version (2)
-	gotLatest, err := store.Get(ctx, tx, "User", id, 0)
-	if err != nil {
-		t.Fatalf("Get latest failed: %v", err)
-	}
-	if gotLatest.SchemaVersion != 2 || gotLatest.StreamVersion != 12 {
-		t.Errorf("expected latest schema 2 at stream version 12, got schema %d at version %d", gotLatest.SchemaVersion, gotLatest.StreamVersion)
+	// Query with maxSchemaVersion <= 0 rejects with error
+	_, err = store.Get(ctx, tx, "User", id, 0)
+	if err == nil {
+		t.Fatal("expected error when maxSchemaVersion <= 0, got nil")
 	}
 
 	// 4. Advance schema 1 to stream_version 15 without altering schema 2
@@ -442,7 +439,7 @@ func TestRepositoryRehydration(t *testing.T) {
 		Marshal: func(u *TestUser) ([]byte, error) {
 			return json.Marshal(u)
 		},
-		Unmarshal: func(data []byte) (*TestUser, error) {
+		Unmarshal: func(streamID string, data []byte) (*TestUser, error) {
 			var u TestUser
 			if err := json.Unmarshal(data, &u); err != nil {
 				return nil, err
@@ -584,7 +581,7 @@ func TestRepositoryErrorBoundaries(t *testing.T) {
 		Marshal: func(u *TestUser) ([]byte, error) {
 			return json.Marshal(u)
 		},
-		Unmarshal: func(data []byte) (*TestUser, error) {
+		Unmarshal: func(streamID string, data []byte) (*TestUser, error) {
 			var u TestUser
 			if err := json.Unmarshal(data, &u); err != nil {
 				return nil, err
@@ -797,7 +794,7 @@ func TestRepositoryMultiVersionRollingDeploymentAndUpcasting(t *testing.T) {
 		Marshal: func(state *TestUser) ([]byte, error) {
 			return json.Marshal(state)
 		},
-		Unmarshal: func(data []byte) (*TestUser, error) {
+		Unmarshal: func(streamID string, data []byte) (*TestUser, error) {
 			var state TestUser
 			if err := json.Unmarshal(data, &state); err != nil {
 				return nil, err
@@ -829,7 +826,7 @@ func TestRepositoryMultiVersionRollingDeploymentAndUpcasting(t *testing.T) {
 		Marshal: func(state *TestUserV2) ([]byte, error) {
 			return json.Marshal(state)
 		},
-		Unmarshal: func(data []byte) (*TestUserV2, error) {
+		Unmarshal: func(streamID string, data []byte) (*TestUserV2, error) {
 			var state TestUserV2
 			if err := json.Unmarshal(data, &state); err != nil {
 				return nil, err
@@ -895,9 +892,6 @@ func TestRepositoryMultiVersionRollingDeploymentAndUpcasting(t *testing.T) {
 	}
 	if loadV2.SnapshotSchemaVersion != 1 {
 		t.Errorf("expected SnapshotSchemaVersion = 1, got %d", loadV2.SnapshotSchemaVersion)
-	}
-	if loadV2.SchemaVersion != 2 {
-		t.Errorf("expected SchemaVersion = 2, got %d", loadV2.SchemaVersion)
 	}
 	if loadV2.SnapshotVersion != 3 {
 		t.Errorf("expected SnapshotVersion = 3, got %d", loadV2.SnapshotVersion)
