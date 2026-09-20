@@ -50,8 +50,11 @@ func GeneratePostgres(config *Config) error {
 func generatePostgresSQL(config *Config) string {
 	return fmt.Sprintf(`-- Snapshots DDL Migration
 -- Generated: %s
+--
+-- Note: Snapshots contain derived, disposable cache data. This table can be
+-- safely truncated or dropped at any time without data loss; missing snapshots
+-- will be transparently rehydrated on demand by replaying the event store log.
 
--- Table to store stream state snapshots
 CREATE TABLE IF NOT EXISTS %s (
     stream_type TEXT NOT NULL,
     stream_id TEXT NOT NULL,
@@ -62,13 +65,8 @@ CREATE TABLE IF NOT EXISTS %s (
     
     PRIMARY KEY (stream_type, stream_id, schema_version)
 );
-
--- Index for schema version analysis/observability
-CREATE INDEX IF NOT EXISTS idx_%s_schema_version 
-    ON %s (schema_version);
 `,
 		time.Now().Format(time.RFC3339),
 		config.SnapshotsTable,
-		config.SnapshotsTable, config.SnapshotsTable,
 	)
 }

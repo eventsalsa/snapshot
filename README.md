@@ -51,9 +51,6 @@ CREATE TABLE IF NOT EXISTS snapshots (
     
     PRIMARY KEY (stream_type, stream_id, schema_version)
 );
-
-CREATE INDEX IF NOT EXISTS idx_snapshots_schema_version 
-    ON snapshots (schema_version);
 ```
 
 Apply this migration using your preferred PostgreSQL migration runner.
@@ -212,6 +209,27 @@ In eventsalsa, sensitive fields (PII or secrets) are protected at the **field le
 Because of this design, the state fields themselves already store ciphertext in memory. Therefore:
 - Standard serialization (via `Marshal`) automatically preserves field-level encryption inside the snapshot payload.
 - You should not encrypt the full snapshot payload. Doing so is unnecessary, breaks payload inspectability, and deviates from eventsalsa's fine-grained field-level encryption boundaries.
+
+### Table Disposability & Cache Semantics
+
+Snapshots contain purely derived, disposable cache data intended to accelerate aggregate rehydration. The event store log remains the authoritative source of truth.
+
+- **Safe to Drop or Truncate**: At any time, you may truncate (`TRUNCATE TABLE snapshots;`) or drop and recreate the table (`DROP TABLE snapshots;`).
+- **Graceful Recovery**: If a snapshot row is missing, corrupted, or incompatible, `snapshot.Repository` transparently falls back to replaying events from version 1. It then saves a fresh snapshot according to policy.
+- **Breaking Table DDL Changes**: On major table schema updates or during early development, dropping and recreating the `snapshots` table is the recommended upgrade path instead of running complex table migrations.
+
+### Retention for Superseded Schema Versions
+
+The compound primary key `(stream_type, stream_id, schema_version)` allows snapshots of multiple schema versions to coexist simultaneously. This enables rolling zero-downtime deployments: existing pods continue querying `schema_version = N` while canary or newly deployed pods query and write `schema_version = N+1`.
+
+Over time, snapshots for retired schema versions remain in the table. Once older application versions are completely decommissioned, you can reclaim storage by running a simple retention cleanup:
+
+```sql
+DELETE FROM snapshots WHERE schema_version < $1;
+```
+
+> [!WARNING]
+> **Rollback Tradeoff**: Deleting rows for older schema versions forfeits instant snapshot-assisted rollbacks for those versions. If a rollback to an older service release occurs after pruning, that service will fall back to replaying full event streams from the log.
 
 ---
 

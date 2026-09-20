@@ -50,14 +50,16 @@ func TestGeneratePostgres_Default(t *testing.T) {
 		"schema_version INT NOT NULL,",
 		"payload BYTEA NOT NULL,",
 		"PRIMARY KEY (stream_type, stream_id, schema_version)",
-		"CREATE INDEX IF NOT EXISTS idx_snapshots_schema_version",
-		"ON snapshots (schema_version);",
 	}
 
 	for _, snippet := range expectedSnippets {
 		if !strings.Contains(sql, snippet) {
 			t.Errorf("expected SQL to contain %q, but got:\n%s", snippet, sql)
 		}
+	}
+
+	if strings.Contains(sql, "CREATE INDEX") {
+		t.Errorf("expected no secondary index in generated DDL, got:\n%s", sql)
 	}
 }
 
@@ -83,8 +85,8 @@ func TestGeneratePostgres_CustomTable(t *testing.T) {
 	if !strings.Contains(sql, "CREATE TABLE IF NOT EXISTS custom_snapshots (") {
 		t.Errorf("expected custom table name in DDL")
 	}
-	if !strings.Contains(sql, "idx_custom_snapshots_schema_version") {
-		t.Errorf("expected custom index name in DDL")
+	if strings.Contains(sql, "CREATE INDEX") {
+		t.Errorf("expected no secondary index in custom table DDL, got:\n%s", sql)
 	}
 }
 
@@ -111,5 +113,8 @@ func TestEmbeddedFS(t *testing.T) {
 	}
 	if strings.Contains(sql, "aggregate") {
 		t.Errorf("embedded migration should not contain 'aggregate', got:\n%s", sql)
+	}
+	if strings.Contains(sql, "CREATE INDEX") {
+		t.Errorf("embedded migration should not contain 'CREATE INDEX', got:\n%s", sql)
 	}
 }
