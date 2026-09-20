@@ -406,35 +406,3 @@ func (r *Repository[T]) Save(ctx context.Context, tx pgx.Tx, id string, version 
 
 	return nil
 }
-
-// SaveAppended applies the events from an append result to the provided state
-// and persists a snapshot of the updated state at the new stream version.
-//
-// This helper guarantees that newly appended events are folded into the in-memory
-// state before the snapshot is serialized and persisted, preventing the critical
-// data loss trap where a snapshot is saved with a new version but stale pre-append state.
-func (r *Repository[T]) SaveAppended(
-	ctx context.Context,
-	tx pgx.Tx,
-	id string,
-	state T,
-	result store.AppendResult,
-) (T, error) {
-	var err error
-	for i := range result.Events {
-		state, err = r.config.Apply(state, result.Events[i])
-		if err != nil {
-			return state, fmt.Errorf("failed to apply appended event v%d: %w", result.Events[i].StreamVersion, err)
-		}
-	}
-
-	if len(result.Events) == 0 {
-		return state, nil
-	}
-
-	err = r.Save(ctx, tx, id, result.ToVersion(), state)
-	if err != nil {
-		return state, err
-	}
-	return state, nil
-}
