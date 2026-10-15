@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.2](https://github.com/eventsalsa/snapshot/compare/v0.0.1...v0.0.2) (2026-10-15)
+
+
+### Bug Fixes
+
+* **deps:** bump actions/upload-artifact from 7.0.1 to 7.0.2 ([#28](https://github.com/eventsalsa/snapshot/issues/28)) ([093b1dc](https://github.com/eventsalsa/snapshot/commit/093b1dce30597d3983403ed70142eacb7be8b798))
+
 ## 0.0.1 (2026-09-20)
 
 
