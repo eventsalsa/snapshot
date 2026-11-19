@@ -1,5 +1,17 @@
 # eventsalsa/snapshot
 
+> [!WARNING]
+> **This repository has moved and is now archived.**
+>
+> Development has moved to the [`eventsalsa/eventsalsa`](https://github.com/eventsalsa/eventsalsa) monorepo at [`snapshot/`](https://github.com/eventsalsa/eventsalsa/tree/main/snapshot), published under the `eventsalsa.dev/snapshot` Go vanity module path (starting at [`snapshot/v0.0.2`](https://github.com/eventsalsa/eventsalsa/releases/tag/snapshot/v0.0.2)):
+> ```bash
+> go get eventsalsa.dev/snapshot@v0.0.2
+> ```
+> - **Source**: https://github.com/eventsalsa/eventsalsa/tree/main/snapshot
+> - **Documentation**: https://eventsalsa.dev/
+> - **Go Reference**: https://pkg.go.dev/eventsalsa.dev/snapshot
+> - **Issues & PRs**: https://github.com/eventsalsa/eventsalsa/issues
+
 [![CI](https://github.com/eventsalsa/snapshot/actions/workflows/ci.yml/badge.svg)](https://github.com/eventsalsa/snapshot/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/eventsalsa/snapshot.svg)](https://pkg.go.dev/github.com/eventsalsa/snapshot)
 
